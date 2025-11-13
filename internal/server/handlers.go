@@ -11,7 +11,6 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -342,7 +341,7 @@ func executeCursorCLI(jobID string, prompt string, projectPath string, cursorCLI
 
 	// 4. (보안 핵심) 자식 프로세스까지 함께 종료하기 위해 Process Group 설정
 	// 타임아웃 시 좀비 프로세스 방지
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	setupProcessGroup(cmd)
 
 	log.Printf("[%s] Executing: %s %s (in %s)", jobID, cursorCLIPath, strings.Join(args, " "), cmd.Dir)
 
@@ -365,9 +364,8 @@ func executeCursorCLI(jobID string, prompt string, projectPath string, cursorCLI
 	if ctx.Err() == context.DeadlineExceeded {
 		log.Printf("[%s] 작업 시간 초과 (120초). 프로세스 그룹 강제 종료 시도...", jobID)
 		// (보안 핵심) 프로세스 그룹 전체를 강제 종료
-		// 음수 PID는 프로세스 그룹 ID를 의미
-		if cmd.Process != nil {
-			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		if err := killProcessGroup(cmd); err != nil {
+			log.Printf("[%s] 프로세스 종료 실패: %v", jobID, err)
 		}
 		return combinedOutput, fmt.Errorf("명령어 실행 시간 초과 (120초)")
 	}
