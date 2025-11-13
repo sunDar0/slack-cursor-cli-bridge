@@ -1,0 +1,337 @@
+basePath: /
+definitions:
+  database.JobRecord:
+    properties:
+      completed_at:
+        type: string
+      created_at:
+        type: string
+      duration:
+        description: milliseconds
+        type: integer
+      error:
+        type: string
+      id:
+        type: string
+      output:
+        type: string
+      project_path:
+        type: string
+      prompt:
+        type: string
+      started_at:
+        type: string
+      status:
+        $ref: '#/definitions/database.JobStatus'
+      user_id:
+        type: string
+      user_name:
+        type: string
+    type: object
+  database.JobStatus:
+    enum:
+    - pending
+    - running
+    - completed
+    - failed
+    type: string
+    x-enum-varnames:
+    - JobStatusPending
+    - JobStatusRunning
+    - JobStatusCompleted
+    - JobStatusFailed
+  server.APICursorRequest:
+    properties:
+      async:
+        example: false
+        type: boolean
+      prompt:
+        example: main.go의 버그를 수정해줘
+        type: string
+    required:
+    - prompt
+    type: object
+  server.APICursorResponse:
+    properties:
+      job_id:
+        example: 550e8400-e29b-41d4-a716-446655440000
+        type: string
+      message:
+        example: Cursor AI 작업이 완료되었습니다.
+        type: string
+      output:
+        example: // 실행 결과 출력
+        type: string
+      status:
+        example: success
+        type: string
+    type: object
+  server.ErrorResponse:
+    properties:
+      error:
+        example: Invalid request payload
+        type: string
+    type: object
+  server.HealthResponse:
+    properties:
+      status:
+        example: ok
+        type: string
+    type: object
+  server.ProjectPathRequest:
+    properties:
+      path:
+        example: /Users/username/projects/my-project
+        type: string
+    required:
+    - path
+    type: object
+  server.ProjectPathResponse:
+    properties:
+      is_set:
+        example: true
+        type: boolean
+      message:
+        example: 프로젝트 경로가 설정되었습니다.
+        type: string
+      path:
+        example: /Users/username/projects/my-project
+        type: string
+    type: object
+  server.SlackImmediateResponse:
+    properties:
+      response_type:
+        example: ephemeral
+        type: string
+      text:
+        example: ⏳ 요청을 접수했습니다. 작업을 처리 중입니다...
+        type: string
+    type: object
+host: localhost:8080
+info:
+  contact:
+    email: support@swagger.io
+    name: API Support
+    url: http://www.swagger.io/support
+  description: |-
+    Slack 슬래시 커맨드를 통해 Cursor Agent를 실행하는 서버입니다.
+    v1.3: SQLite 작업 결과 저장 및 조회
+    v1.2: 동적 프로젝트 경로 관리 (런타임 설정/변경)
+    v1.1: 자연어 프롬프트 방식, Process Group 관리, SSRF 방어
+    주요 기능: HMAC 인증 + 비동기 실행 + 보안 강화 + 동적 경로 관리 + 작업 결과 저장
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+  termsOfService: http://swagger.io/terms/
+  title: Slack-Cursor-CLI API (v1.3)
+  version: "1.3"
+paths:
+  /api/config/project-path:
+    get:
+      description: 현재 설정된 프로젝트 경로를 조회합니다.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: 프로젝트 경로 정보
+          schema:
+            $ref: '#/definitions/server.ProjectPathResponse'
+      summary: 프로젝트 경로 조회 (v1.2)
+      tags:
+      - config
+    post:
+      consumes:
+      - application/json
+      description: |-
+        cursor-agent가 실행될 프로젝트 경로를 설정합니다.
+        이 경로는 런타임에 동적으로 변경 가능합니다.
+      parameters:
+      - description: 프로젝트 경로
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/server.ProjectPathRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: 경로 설정 성공
+          schema:
+            $ref: '#/definitions/server.ProjectPathResponse'
+        "400":
+          description: 잘못된 요청
+          schema:
+            $ref: '#/definitions/server.ErrorResponse'
+      summary: 프로젝트 경로 설정 (v1.2)
+      tags:
+      - config
+  /api/cursor:
+    post:
+      consumes:
+      - application/json
+      description: |-
+        JSON 형식으로 cursor-agent를 실행합니다. Slack 인증이 필요 없습니다.
+        v1.1: 자연어 프롬프트 방식 (파일명을 프롬프트에 직접 포함)
+        async=false: 동기 실행 (결과를 즉시 반환)
+        async=true: 비동기 실행 (job_id만 반환, 결과는 별도 조회 필요 - 원 단계에서 구현)
+      parameters:
+      - description: Cursor 실행 요청
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/server.APICursorRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: 실행 성공
+          schema:
+            $ref: '#/definitions/server.APICursorResponse'
+        "400":
+          description: 잘못된 요청
+          schema:
+            $ref: '#/definitions/server.ErrorResponse'
+        "500":
+          description: 서버 오류
+          schema:
+            $ref: '#/definitions/server.ErrorResponse'
+      summary: 일반 API를 통한 Cursor Agent 실행 (v1.1)
+      tags:
+      - api
+  /api/jobs:
+    get:
+      description: 작업 목록을 조회합니다. 상태별 필터링과 페이지네이션을 지원합니다.
+      parameters:
+      - description: '조회할 개수 (기본값: 10)'
+        in: query
+        name: limit
+        type: integer
+      - description: '건너뛸 개수 (기본값: 0)'
+        in: query
+        name: offset
+        type: integer
+      - description: 작업 상태 필터 (pending/running/completed/failed)
+        in: query
+        name: status
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: 작업 목록
+          schema:
+            items:
+              $ref: '#/definitions/database.JobRecord'
+            type: array
+        "400":
+          description: 잘못된 요청
+          schema:
+            $ref: '#/definitions/server.ErrorResponse'
+      summary: 작업 목록 조회 (v1.3)
+      tags:
+      - jobs
+  /api/jobs/{id}:
+    get:
+      description: Job ID로 작업 실행 결과를 조회합니다.
+      parameters:
+      - description: Job ID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: 작업 결과
+          schema:
+            $ref: '#/definitions/database.JobRecord'
+        "404":
+          description: 작업을 찾을 수 없음
+          schema:
+            $ref: '#/definitions/server.ErrorResponse'
+      summary: 작업 결과 조회 (v1.3)
+      tags:
+      - jobs
+  /health:
+    get:
+      description: 서버가 정상 동작 중인지 확인합니다.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/server.HealthResponse'
+      summary: 서버 상태 확인
+      tags:
+      - health
+  /slack/cursor:
+    post:
+      consumes:
+      - application/x-www-form-urlencoded
+      description: |-
+        Slack의 /cursor 슬래시 커맨드를 받아 cursor-agent를 비동기로 실행합니다.
+        v1.1: 자연어 프롬프트 방식 사용 (파일명을 프롬프트에 직접 포함)
+        HMAC-SHA256 서명 검증 및 타임스탬프 검증이 필요합니다.
+      parameters:
+      - description: '자연어 프롬프트 (예: ''main.go의 버그를 수정해줘'')'
+        in: formData
+        name: text
+        required: true
+        type: string
+      - description: Slack 사용자명
+        in: formData
+        name: user_name
+        required: true
+        type: string
+      - description: Slack 사용자 ID
+        in: formData
+        name: user_id
+        required: true
+        type: string
+      - description: 지연 응답을 보낼 Slack Webhook URL
+        in: formData
+        name: response_url
+        required: true
+        type: string
+      - description: Slack 트리거 ID
+        in: formData
+        name: trigger_id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: 즉시 ACK 응답
+          schema:
+            $ref: '#/definitions/server.SlackImmediateResponse'
+        "400":
+          description: 잘못된 요청
+          schema:
+            $ref: '#/definitions/server.ErrorResponse'
+        "401":
+          description: 인증 실패
+          schema:
+            $ref: '#/definitions/server.ErrorResponse'
+      security:
+      - SlackSignature: []
+      - SlackTimestamp: []
+      summary: Slack 슬래시 커맨드 처리 (v1.1)
+      tags:
+      - slack
+securityDefinitions:
+  SlackSignature:
+    description: Slack HMAC-SHA256 서명
+    in: header
+    name: X-Slack-Signature
+    type: apiKey
+  SlackTimestamp:
+    description: Slack 요청 타임스탬프 (Unix timestamp)
+    in: header
+    name: X-Slack-Request-Timestamp
+    type: apiKey
+swagger: "2.0"
