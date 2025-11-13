@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"log"
 	"os"
 
@@ -8,6 +9,7 @@ import (
 	_ "github.com/kakaovx/cursor-slack-server/docs" // Swagger docs
 	"github.com/kakaovx/cursor-slack-server/internal/database"
 	"github.com/kakaovx/cursor-slack-server/internal/server"
+	"github.com/kakaovx/cursor-slack-server/internal/setup"
 )
 
 // @title           Slack-Cursor-CLI API (v1.3)
@@ -40,6 +42,18 @@ import (
 // @description Slack 요청 타임스탬프 (Unix timestamp)
 
 func main() {
+	// CLI 플래그 파싱
+	setupMode := flag.Bool("setup", false, "대화형 설정 마법사 실행")
+	flag.Parse()
+
+	// 설정 모드인 경우 설정 마법사 실행
+	if *setupMode {
+		if err := setup.RunSetup(); err != nil {
+			log.Fatalf("설정 실패: %v", err)
+		}
+		return
+	}
+
 	// .env 파일 로드 (파일이 없어도 에러는 무시)
 	if err := godotenv.Load(); err != nil {
 		log.Println("⚠️  .env 파일을 찾을 수 없습니다. 시스템 환경변수를 사용합니다.")
