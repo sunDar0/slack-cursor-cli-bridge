@@ -8,7 +8,5 @@ data/
 *.db
 *.db-journal
 
-# Development scripts
-.dev-pids
-server.log
-ngrok.log
+# Development logs
+logs/
