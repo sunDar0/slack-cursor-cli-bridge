@@ -10,3 +10,6 @@ data/
 
 # Development logs
 logs/
+
+# Build artifacts
+bin/
