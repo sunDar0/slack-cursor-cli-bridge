@@ -13,3 +13,4 @@ logs/
 
 # Build artifacts
 bin/
+dist/
