@@ -13,7 +13,8 @@ import (
 	"time"
 
 	"github.com/kakaovx/cursor-slack-server/internal/database"
-	"github.com/kakaovx/cursor-slack-server/internal/server"
+	"github.com/kakaovx/cursor-slack-server/internal/process"
+	"github.com/kakaovx/cursor-slack-server/internal/types"
 )
 
 // TaskExecutor는 실제 cursor-agent 작업을 실행하고 모든 보안 검증을 수행합니다.
@@ -28,12 +29,38 @@ func NewTaskExecutor(allowedDomains []string) *TaskExecutor {
 	}
 }
 
+// Config 인터페이스 정의 (순환 참조 방지)
+type Config interface {
+	GetProjectPath() (string, bool)
+}
+
+// DBInterface 인터페이스 정의
+type DBInterface interface {
+	CreateJob(job *database.JobRecord) error
+	UpdateJobStatus(jobID string, status database.JobStatus) error
+	UpdateJobResult(jobID string, output string, errorMsg string) error
+}
+
+// ConfigFull은 전체 설정을 담는 구조체입니다 (타입 assertion용)
+type ConfigFull struct {
+	CursorCLIPath string
+	DB            DBInterface
+	Config
+}
+
 // Run은 Job을 받아 (1)검증 -> (2)실행 -> (3)응답의 전체 파이프라인을 수행합니다.
 func (te *TaskExecutor) Run(job Job) {
 	payload := job.Payload
+	
+	// Config 타입 assertion
+	cfg, ok := job.Config.(*ConfigFull)
+	if !ok {
+		log.Printf("[%s] 잘못된 Config 타입", job.ID)
+		return
+	}
+	
 	responseURL := payload.ResponseURL
 	jobID := job.ID
-	cfg := job.Config
 
 	// 1. 프롬프트 추출 (v1.1: 단순화)
 	prompt := strings.TrimSpace(payload.Text)
@@ -41,7 +68,9 @@ func (te *TaskExecutor) Run(job Job) {
 	if prompt == "" {
 		errMsg := "❌ 프롬프트가 비어있습니다. 사용법: /cursor \"자연어 프롬프트\""
 		log.Printf("[%s] %s", jobID, errMsg)
-		te.sendDelayedResponse(responseURL, errMsg)
+		if responseURL != "" {
+			te.sendDelayedResponse(responseURL, errMsg)
+		}
 		return
 	}
 
@@ -52,7 +81,9 @@ func (te *TaskExecutor) Run(job Job) {
 			"먼저 `/cursor set-path <프로젝트_경로>` 명령어로 경로를 설정해주세요.\n" +
 			"예시: `/cursor set-path /Users/username/projects/my-project`"
 		log.Printf("[%s] %s", jobID, errMsg)
-		te.sendDelayedResponse(responseURL, errMsg)
+		if responseURL != "" {
+			te.sendDelayedResponse(responseURL, errMsg)
+		}
 		return
 	}
 
@@ -76,8 +107,10 @@ func (te *TaskExecutor) Run(job Job) {
 	// 진행 상황 업데이트를 위한 channel
 	progressDone := make(chan struct{})
 	
-	// 주기적으로 진행 상황 전송 (2분마다, 최대 4회)
-	go te.sendProgressUpdates(jobID, responseURL, progressDone)
+	// 주기적으로 진행 상황 전송 (2분마다, 최대 4회) - Slack 요청인 경우에만
+	if responseURL != "" {
+		go te.sendProgressUpdates(jobID, responseURL, progressDone)
+	}
 
 	// 2. cursor-agent 실행 (v1.1: --force 추가, --files 제거)
 	log.Printf("[%s] 작업자 실행 시작: prompt='%s'", jobID, prompt)
@@ -96,8 +129,10 @@ func (te *TaskExecutor) Run(job Job) {
 		cfg.DB.UpdateJobStatus(jobID, database.JobStatusFailed)
 		
 		// 에러 메시지 포맷팅 (마크다운 적용)
-		messages := te.formatErrorOutput(jobID, err, rawOutput)
-		te.sendMultipleMessages(responseURL, messages, jobID)
+		if responseURL != "" {
+			messages := te.formatErrorOutput(jobID, err, rawOutput)
+			te.sendMultipleMessages(responseURL, messages, jobID)
+		}
 	} else {
 		log.Printf("[%s] 작업자 실행 완료.", jobID)
 
@@ -106,8 +141,10 @@ func (te *TaskExecutor) Run(job Job) {
 		cfg.DB.UpdateJobStatus(jobID, database.JobStatusCompleted)
 		
 		// 성공 메시지 포맷팅 (마크다운 적용, before/after 표시)
-		messages := te.formatSuccessOutput(jobID, rawOutput, prompt)
-		te.sendMultipleMessages(responseURL, messages, jobID)
+		if responseURL != "" {
+			messages := te.formatSuccessOutput(jobID, rawOutput, prompt)
+			te.sendMultipleMessages(responseURL, messages, jobID)
+		}
 	}
 }
 
@@ -132,7 +169,7 @@ func (te *TaskExecutor) executeCursorCommand(jobID string, prompt string, projec
 
 	// 4. (보안 핵심) 자식 프로세스까지 함께 종료하기 위해 Process Group 설정
 	// 타임아웃 시 좀비 프로세스 방지
-	server.SetupProcessGroup(cmd)
+	process.SetupProcessGroup(cmd)
 
 	log.Printf("[%s] Executing: %s %s (in %s)", jobID, cursorCLIPath, strings.Join(args, " "), cmd.Dir)
 
@@ -157,7 +194,7 @@ func (te *TaskExecutor) executeCursorCommand(jobID string, prompt string, projec
 	case <-ctx.Done():
 		// 타임아웃 발생 - 프로세스 그룹 강제 종료
 		log.Printf("[%s] 작업 시간 초과 (15분). 프로세스 그룹 강제 종료 시도...", jobID)
-		if err := server.KillProcessGroup(cmd); err != nil {
+		if err := process.KillProcessGroup(cmd); err != nil {
 			log.Printf("[%s] 프로세스 종료 실패: %v", jobID, err)
 		}
 		// cmd.Wait()가 완료될 때까지 잠시 대기 (최대 2초)
@@ -257,7 +294,7 @@ func (te *TaskExecutor) sendProgressMessage(responseURL string, message string) 
 	}
 
 	// 4. Slack 메시지 전송 (새 메시지 추가)
-	payload := server.SlackDelayedResponse{
+	payload := types.SlackDelayedResponse{
 		Text:         message,
 		ResponseType: "in_channel", // 채널에 공개
 	}
@@ -300,6 +337,15 @@ func (te *TaskExecutor) formatSuccessOutput(jobID string, rawOutput string, prom
 		result.WriteString("\n")
 	}
 	
+	// 실제 코드 변경 내용 추출 (코드 블록 형태로 표시)
+	codeChanges := te.extractCodeChanges(lines)
+	if codeChanges != "" {
+		result.WriteString("💻 *변경된 코드*\n")
+		result.WriteString("```\n")
+		result.WriteString(codeChanges)
+		result.WriteString("```\n\n")
+	}
+	
 	// 주요 변경 사항 추출 (diff가 있으면 표시)
 	changes := te.extractChangeSummary(lines)
 	if changes != "" {
@@ -308,9 +354,10 @@ func (te *TaskExecutor) formatSuccessOutput(jobID string, rawOutput string, prom
 		result.WriteString("\n")
 	}
 	
-	// 원본 출력 (마크다운 렌더링을 위해 코드블록 제거)
+	// 원본 출력 (마크다운 → Slack mrkdwn 변환)
 	result.WriteString("📄 *실행 결과*\n")
-	result.WriteString(rawOutput)
+	slackFormattedOutput := te.convertMarkdownToSlack(rawOutput)
+	result.WriteString(slackFormattedOutput)
 	result.WriteString(fmt.Sprintf("\n\n🆔 Job ID: `%s`", jobID[:8]))
 	
 	// 메시지를 40,000자 단위로 분할
@@ -326,8 +373,9 @@ func (te *TaskExecutor) formatErrorOutput(jobID string, err error, rawOutput str
 	
 	if rawOutput != "" {
 		result.WriteString("📄 *출력 내용*\n")
-		// 에러 출력도 마크다운 렌더링 가능하도록 코드블록 제거
-		result.WriteString(rawOutput)
+		// 에러 출력도 Slack 형식으로 변환
+		slackFormattedOutput := te.convertMarkdownToSlack(rawOutput)
+		result.WriteString(slackFormattedOutput)
 		result.WriteString("\n")
 	}
 	
@@ -372,6 +420,132 @@ func (te *TaskExecutor) extractModifiedFiles(lines []string) []string {
 	}
 	
 	return files
+}
+
+// extractCodeChanges는 실제 코드 변경 내용을 추출합니다 (코드 블록 형태로 반환).
+func (te *TaskExecutor) extractCodeChanges(lines []string) string {
+	var codeChanges strings.Builder
+	inDiff := false
+	inCodeBlock := false
+	diffCount := 0
+	maxDiffLines := 150 // 코드 변경 내용은 최대 150줄까지 표시
+	codeBlockLines := 0
+	
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		originalLine := line
+		
+		// 코드 블록 시작/종료 감지 (마크다운 코드 블록)
+		if strings.HasPrefix(trimmed, "```") {
+			if !inCodeBlock {
+				// 코드 블록 시작
+				inCodeBlock = true
+				codeBlockLines = 0
+				// 언어 지정이 있으면 포함
+				if len(trimmed) > 3 {
+					codeChanges.WriteString(originalLine)
+					codeChanges.WriteString("\n")
+				}
+			} else {
+				// 코드 블록 종료
+				inCodeBlock = false
+				codeChanges.WriteString(originalLine)
+				codeChanges.WriteString("\n")
+			}
+			continue
+		}
+		
+		// 코드 블록 내부의 내용 추출
+		if inCodeBlock {
+			if codeBlockLines < maxDiffLines {
+				codeChanges.WriteString(originalLine)
+				codeChanges.WriteString("\n")
+				codeBlockLines++
+				diffCount++
+			}
+			continue
+		}
+		
+		// diff 시작 감지
+		if strings.HasPrefix(trimmed, "diff --git") || 
+		   strings.HasPrefix(trimmed, "---") || 
+		   strings.HasPrefix(trimmed, "+++") ||
+		   strings.HasPrefix(trimmed, "@@") {
+			inDiff = true
+			// diff 헤더는 포함하지 않음
+			continue
+		}
+		
+		// diff 내용 (+ or - 로 시작하는 실제 코드 변경)
+		if inDiff {
+			// diff 형식: + 추가된 라인, - 삭제된 라인, 공백으로 시작하면 컨텍스트
+			if strings.HasPrefix(trimmed, "+") && !strings.HasPrefix(trimmed, "+++") {
+				// 추가된 코드 라인
+				if diffCount < maxDiffLines {
+					codeChanges.WriteString(originalLine)
+					codeChanges.WriteString("\n")
+					diffCount++
+				}
+			} else if strings.HasPrefix(trimmed, "-") && !strings.HasPrefix(trimmed, "---") {
+				// 삭제된 코드 라인
+				if diffCount < maxDiffLines {
+					codeChanges.WriteString(originalLine)
+					codeChanges.WriteString("\n")
+					diffCount++
+				}
+			} else if strings.HasPrefix(trimmed, " ") {
+				// 컨텍스트 라인 (변경되지 않은 코드, 최대 3줄만 포함)
+				if diffCount < maxDiffLines && i > 0 && i < len(lines)-1 {
+					// 이전 또는 다음 라인이 변경사항인 경우에만 컨텍스트 포함
+					prevTrimmed := strings.TrimSpace(lines[i-1])
+					nextTrimmed := ""
+					if i+1 < len(lines) {
+						nextTrimmed = strings.TrimSpace(lines[i+1])
+					}
+					if (strings.HasPrefix(prevTrimmed, "+") || strings.HasPrefix(prevTrimmed, "-")) ||
+					   (strings.HasPrefix(nextTrimmed, "+") || strings.HasPrefix(nextTrimmed, "-")) {
+						if diffCount < maxDiffLines {
+							codeChanges.WriteString(originalLine)
+							codeChanges.WriteString("\n")
+							diffCount++
+						}
+					}
+				}
+			} else if trimmed == "" {
+				// 빈 줄은 diff 구분자로 사용
+				if diffCount > 0 && diffCount < maxDiffLines {
+					codeChanges.WriteString("\n")
+				}
+			}
+		}
+		
+		// diff 섹션이 끝났는지 확인 (다음 주요 섹션 시작)
+		if inDiff && trimmed != "" && 
+		   !strings.HasPrefix(trimmed, "+") && 
+		   !strings.HasPrefix(trimmed, "-") && 
+		   !strings.HasPrefix(trimmed, " ") &&
+		   !strings.HasPrefix(trimmed, "@@") &&
+		   !strings.HasPrefix(trimmed, "diff") &&
+		   !strings.HasPrefix(trimmed, "---") &&
+		   !strings.HasPrefix(trimmed, "+++") &&
+		   !strings.HasPrefix(trimmed, "index") &&
+		   !strings.HasPrefix(trimmed, "\\") {
+			// diff 섹션 종료
+			inDiff = false
+		}
+	}
+	
+	if diffCount >= maxDiffLines {
+		codeChanges.WriteString("\n... (더 많은 변경 사항이 있습니다. 전체 내용은 실행 결과를 확인하세요)\n")
+	}
+	
+	result := codeChanges.String()
+	// 빈 결과면 반환하지 않음
+	if strings.TrimSpace(result) == "" {
+		return ""
+	}
+	
+	return result
 }
 
 // extractChangeSummary는 변경 사항 요약을 추출합니다.
@@ -427,6 +601,125 @@ func contains(slice []string, item string) bool {
 		}
 	}
 	return false
+}
+
+// convertMarkdownToSlack은 표준 마크다운을 Slack mrkdwn 형식으로 변환합니다.
+func (te *TaskExecutor) convertMarkdownToSlack(markdown string) string {
+	lines := strings.Split(markdown, "\n")
+	var result strings.Builder
+	inCodeBlock := false
+	
+	for _, line := range lines {
+		// 코드 블록 시작/종료 감지
+		if strings.HasPrefix(strings.TrimSpace(line), "```") {
+			inCodeBlock = !inCodeBlock
+			result.WriteString(line)
+			result.WriteString("\n")
+			continue
+		}
+		
+		// 코드 블록 내부는 변환하지 않음
+		if inCodeBlock {
+			result.WriteString(line)
+			result.WriteString("\n")
+			continue
+		}
+		
+		// 1. 마크다운 제목 → Slack 볼드
+		// ### Title → *Title*
+		// ## Title → *Title*
+		// # Title → *Title*
+		if strings.HasPrefix(strings.TrimSpace(line), "#") {
+			// 제목 레벨 추출
+			trimmed := strings.TrimSpace(line)
+			level := 0
+			for i, ch := range trimmed {
+				if ch == '#' {
+					level++
+				} else {
+					trimmed = strings.TrimSpace(trimmed[i:])
+					break
+				}
+			}
+			
+			// Slack 볼드로 변환 (레벨에 따라 이모지 추가)
+			var prefix string
+			switch level {
+			case 1:
+				prefix = "📌 *" // H1
+			case 2:
+				prefix = "▪️ *" // H2
+			case 3:
+				prefix = "  • *" // H3
+			default:
+				prefix = "    - *" // H4+
+			}
+			result.WriteString(prefix + trimmed + "*\n")
+			continue
+		}
+		
+		// 2. 볼드: **text** → *text*
+		line = strings.ReplaceAll(line, "**", "*")
+		
+		// 3. 마크다운 링크: [text](url) → <url|text>
+		// 간단한 정규식 대신 수동 파싱 (정규식 사용 시 import "regexp" 필요)
+		line = te.convertMarkdownLinks(line)
+		
+		// 4. 리스트 항목 정리 (마크다운 - 또는 * → Slack 불릿)
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "- ") {
+			// 들여쓰기 유지
+			indent := len(line) - len(strings.TrimLeft(line, " \t"))
+			line = strings.Repeat(" ", indent) + "• " + trimmed[2:]
+		} else if strings.HasPrefix(trimmed, "* ") && !strings.HasPrefix(trimmed, "**") {
+			indent := len(line) - len(strings.TrimLeft(line, " \t"))
+			line = strings.Repeat(" ", indent) + "• " + trimmed[2:]
+		}
+		
+		result.WriteString(line)
+		result.WriteString("\n")
+	}
+	
+	return result.String()
+}
+
+// convertMarkdownLinks는 마크다운 링크 [text](url)를 Slack 형식 <url|text>로 변환합니다.
+func (te *TaskExecutor) convertMarkdownLinks(text string) string {
+	// [text](url) 패턴을 찾아서 변환
+	result := text
+	
+	// 간단한 구현: [로 시작하는 패턴 찾기
+	for {
+		start := strings.Index(result, "[")
+		if start == -1 {
+			break
+		}
+		
+		end := strings.Index(result[start:], "](")
+		if end == -1 {
+			break
+		}
+		end += start
+		
+		urlStart := end + 2
+		urlEnd := strings.Index(result[urlStart:], ")")
+		if urlEnd == -1 {
+			break
+		}
+		urlEnd += urlStart
+		
+		// 추출
+		linkText := result[start+1 : end]
+		url := result[urlStart:urlEnd]
+		
+		// Slack 형식으로 변환
+		slackLink := fmt.Sprintf("<%s|%s>", url, linkText)
+		
+		// 교체
+		result = result[:start] + slackLink + result[urlEnd+1:]
+	}
+	
+	return result
 }
 
 // splitMessage는 메시지를 Slack 최대 크기(40,000자)로 분할합니다.
@@ -526,7 +819,7 @@ func (te *TaskExecutor) sendDelayedResponse(responseURL string, message string) 
 	}
 
 	// 4. Slack 응답 전송
-	payload := server.SlackDelayedResponse{
+	payload := types.SlackDelayedResponse{
 		Text:         message,
 		ResponseType: "in_channel", // 채널에 공개
 	}

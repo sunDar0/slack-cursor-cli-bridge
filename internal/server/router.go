@@ -7,6 +7,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/kakaovx/cursor-slack-server/internal/database"
 	"github.com/kakaovx/cursor-slack-server/internal/server/middleware"
+	"github.com/kakaovx/cursor-slack-server/internal/worker"
 	swaggerFiles "github.com/swaggo/files"
 	ginSwagger "github.com/swaggo/gin-swagger"
 )
@@ -15,6 +16,7 @@ import (
 // v1.1: AllowedResponseDomains 추가 (SSRF 방어)
 // v1.2: ProjectPath를 동적으로 관리 (런타임 설정/변경 가능)
 // v1.3: SQLite DB 추가 (작업 결과 저장)
+// v1.4: Worker Pool 추가 (동시 실행 제어)
 type Config struct {
 	SigningSecret          string
 	projectPath            string           // private: 동적 설정
@@ -22,6 +24,8 @@ type Config struct {
 	CursorCLIPath          string
 	AllowedResponseDomains []string         // SSRF 방어용 허용 도메인 목록
 	DB                     *database.DB     // SQLite 데이터베이스
+	Dispatcher             *worker.Dispatcher // Worker Pool 디스패처
+	JobQueue               chan worker.Job    // 작업 큐
 	mu                     sync.RWMutex
 }
 
@@ -40,6 +44,15 @@ func (c *Config) GetProjectPath() (string, bool) {
 		return "", false
 	}
 	return c.projectPath, true
+}
+
+// ToWorkerConfig는 Config를 worker.ConfigFull로 변환합니다.
+func (c *Config) ToWorkerConfig() *worker.ConfigFull {
+	return &worker.ConfigFull{
+		CursorCLIPath: c.CursorCLIPath,
+		DB:            c.DB,
+		Config:        c,
+	}
 }
 
 // SetupRouter는 Gin 라우터와 미들웨어, 핸들러를 설정합니다.

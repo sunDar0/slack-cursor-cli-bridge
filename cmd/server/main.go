@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 	"github.com/kakaovx/cursor-slack-server/internal/ngrok"
 	"github.com/kakaovx/cursor-slack-server/internal/server"
 	"github.com/kakaovx/cursor-slack-server/internal/setup"
+	"github.com/kakaovx/cursor-slack-server/internal/worker"
 )
 
 // @title           Slack-Cursor-CLI API (v1.3)
@@ -209,13 +211,36 @@ func main() {
 	log.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 	log.Println()
 
-	// 설정 정보를 담은 구조체 (v1.2: 동적 경로 관리, v1.3: DB 추가)
+	// v1.4: Worker Pool 설정
+	maxWorkers := 3 // 기본값: 3개의 동시 작업
+	if maxWorkersEnv := os.Getenv("MAX_WORKERS"); maxWorkersEnv != "" {
+		if parsed, err := strconv.Atoi(maxWorkersEnv); err == nil && parsed > 0 {
+			maxWorkers = parsed
+		}
+	}
+	
+	// 작업 큐 생성 (버퍼 크기: maxWorkers * 2)
+	jobQueue := make(chan worker.Job, maxWorkers*2)
+	
+	// TaskExecutor 생성
+	taskExecutor := worker.NewTaskExecutor(allowedDomains)
+	
+	// Dispatcher 생성 및 시작
+	dispatcher := worker.NewDispatcher(jobQueue, maxWorkers)
+	dispatcher.Start(taskExecutor)
+	
+	log.Printf("🔧 Worker Pool 초기화 완료: %d개 작업자, 큐 크기: %d", maxWorkers, maxWorkers*2)
+	log.Println()
+
+	// 설정 정보를 담은 구조체 (v1.2: 동적 경로 관리, v1.3: DB 추가, v1.4: Worker Pool 추가)
 	config := &server.Config{
 		SigningSecret:          signingSecret,
 		Port:                   port,
 		CursorCLIPath:          cursorCLIPath,
 		AllowedResponseDomains: allowedDomains,
 		DB:                     db,
+		Dispatcher:             dispatcher,
+		JobQueue:               jobQueue,
 	}
 
 	// 환경 변수로 초기 프로젝트 경로 설정 (있는 경우)
@@ -261,6 +286,11 @@ func main() {
 	<-quit
 
 	log.Println("🛑 서버를 종료합니다...")
+
+	// v1.4: Worker Pool 종료
+	if config.Dispatcher != nil {
+		config.Dispatcher.Stop()
+	}
 
 	// ngrok 종료
 	if ngrokManager != nil {

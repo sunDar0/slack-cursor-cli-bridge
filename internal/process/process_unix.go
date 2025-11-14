@@ -1,7 +1,7 @@
 //go:build !windows
 // +build !windows
 
-package server
+package process
 
 import (
 	"os/exec"

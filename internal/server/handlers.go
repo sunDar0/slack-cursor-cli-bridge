@@ -8,7 +8,6 @@ import (
 	"log"
 	"net/http"
 	"net/url"
-	"os/exec"
 	"strconv"
 	"strings"
 	"time"
@@ -17,23 +16,9 @@ import (
 	"github.com/google/uuid"
 	"github.com/kakaovx/cursor-slack-server/internal/database"
 	"github.com/kakaovx/cursor-slack-server/internal/server/middleware"
+	"github.com/kakaovx/cursor-slack-server/internal/types"
+	"github.com/kakaovx/cursor-slack-server/internal/worker"
 )
-
-// SlackCommandPayload는 Slack이 보내는 폼 데이터를 바인딩합니다.
-// v1.1: 자연어 프롬프트 방식 (파일명을 프롬프트에 포함)
-type SlackCommandPayload struct {
-	Text        string `form:"text" example:"main.go의 버그를 수정해줘"`
-	UserName    string `form:"user_name" example:"john_doe"`
-	UserID      string `form:"user_id" example:"U1234567890"`
-	ResponseURL string `form:"response_url" example:"https://hooks.slack.com/commands/1234567890/1234567890/abcdefghijklmnopqrstuvwxyz"`
-	TriggerID   string `form:"trigger_id" example:"1234567890.1234567890.abcdefghijklmnopqrstuvwxyz"`
-}
-
-// SlackDelayedResponse는 Slack 지연 응답용 JSON 구조체입니다.
-type SlackDelayedResponse struct {
-	Text         string `json:"text" example:"✅ Cursor AI 작업 완료"`
-	ResponseType string `json:"response_type" example:"in_channel"` // "in_channel" 또는 "ephemeral"
-}
 
 // SlackImmediateResponse는 Slack 즉시 응답용 JSON 구조체입니다.
 type SlackImmediateResponse struct {
@@ -94,7 +79,7 @@ type ProjectPathResponse struct {
 // @Router       /slack/cursor [post]
 func HandleSlashCursor(cfg *Config) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		var payload SlackCommandPayload
+		var payload types.SlackCommandPayload
 
 		if err := c.ShouldBind(&payload); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request payload"})
@@ -162,16 +147,29 @@ func HandleSlashCursor(cfg *Config) gin.HandlerFunc {
 		// 1. 즉시 응답 (ACK) - 3초 룰 준수
 		c.JSON(http.StatusOK, gin.H{
 			"response_type": "ephemeral",
-			"text":          "⏳ " + payload.UserName + "님의 요청을 접수했습니다. 작업을 처리 중입니다...",
+			"text":          fmt.Sprintf("⏳ %s님의 요청을 접수했습니다. 작업을 처리 중입니다...\n💡 최대 대기시간: 15분", payload.UserName),
 		})
 
-		// 2. 비동기로 cursor-agent 실행
+		// 2. Worker Pool을 통해 작업 제출 (v1.4)
 		reqID, exists := c.Get(middleware.RequestIDKey)
 		if !exists {
 			reqID = uuid.NewString()
 		}
+		jobID := reqID.(string)
 
-		go executeCursorTask(reqID.(string), payload, cfg)
+		// Job 생성 및 큐에 제출 (ConfigFull wrapper 생성)
+		job := worker.Job{
+			ID:         jobID,
+			Payload:    payload,
+			ReceivedAt: time.Now(),
+			Config:     cfg.ToWorkerConfig(),
+		}
+
+		// 비동기로 큐에 제출 (큐가 가득 차면 블록될 수 있음)
+		go func() {
+			cfg.JobQueue <- job
+			log.Printf("[%s] 작업이 큐에 제출되었습니다.", jobID)
+		}()
 	}
 }
 
@@ -222,216 +220,103 @@ func HandleAPICursor(cfg *Config) gin.HandlerFunc {
 			log.Printf("[%s] DB 작업 생성 실패: %v", jobID, err)
 		}
 
-		// 비동기 모드
+		// v1.4: Worker Pool을 통해 작업 제출
+		// API는 항상 비동기로 처리 (동시 실행 제어를 위해)
+		// 동기 모드 요청도 Worker Pool을 통해 처리하되, 결과는 DB에서 조회해야 함
+		
+		// SlackCommandPayload 형식으로 변환 (API 요청용)
+		slackPayload := types.SlackCommandPayload{
+			Text:        req.Prompt,
+			UserName:    "api-user",
+			UserID:      "api",
+			ResponseURL: "", // API는 response_url이 없음
+		}
+
+		// Job 생성 및 큐에 제출 (ConfigFull wrapper 생성)
+		job := worker.Job{
+			ID:         jobID,
+			Payload:    slackPayload,
+			ReceivedAt: time.Now(),
+			Config:     cfg.ToWorkerConfig(),
+		}
+
+		// 비동기로 큐에 제출
+		go func() {
+			cfg.JobQueue <- job
+			log.Printf("[%s] API 작업이 큐에 제출되었습니다.", jobID)
+		}()
+
+		// 비동기 모드: job_id만 즉시 반환
 		if req.Async {
-			// 비동기로 실행하고 job_id만 즉시 반환
-			go func() {
-				// 작업 시작 상태 업데이트
-				cfg.DB.UpdateJobStatus(jobID, database.JobStatusRunning)
-
-				output, err := executeCursorCLI(jobID, req.Prompt, projectPath, cfg.CursorCLIPath)
-				
-				// v1.3: 결과 저장
-				if err != nil {
-					log.Printf("[%s] API 비동기 실행 오류: %v, output: %s", jobID, err, string(output))
-					cfg.DB.UpdateJobResult(jobID, string(output), err.Error())
-					cfg.DB.UpdateJobStatus(jobID, database.JobStatusFailed)
-				} else {
-					log.Printf("[%s] API 비동기 실행 완료", jobID)
-					cfg.DB.UpdateJobResult(jobID, string(output), "")
-					cfg.DB.UpdateJobStatus(jobID, database.JobStatusCompleted)
-				}
-			}()
-
 			c.JSON(http.StatusOK, APICursorResponse{
 				Status:  "accepted",
-				Message: "작업이 비동기로 시작되었습니다. (현재 점 단계에서는 결과 조회 미지원)",
+				Message: "작업이 비동기로 시작되었습니다. GET /api/jobs/{id}로 결과를 조회하세요.",
 				JobID:   jobID,
 			})
 			return
 		}
 
-		// 동기 모드 - 실행 결과를 즉시 반환
-		cfg.DB.UpdateJobStatus(jobID, database.JobStatusRunning)
-		output, err := executeCursorCLI(jobID, req.Prompt, projectPath, cfg.CursorCLIPath)
+		// 동기 모드: 작업 완료까지 대기 (최대 15분)
+		// 주의: 이 방식은 HTTP 연결을 오래 유지하므로 권장하지 않지만,
+		// 기존 API 호환성을 위해 유지
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+		defer cancel()
 
-		if err != nil {
-			log.Printf("[%s] API 동기 실행 오류: %v", jobID, err)
-			// v1.3: 실패 결과 저장
-			cfg.DB.UpdateJobResult(jobID, string(output), err.Error())
-			cfg.DB.UpdateJobStatus(jobID, database.JobStatusFailed)
-			
-			c.JSON(http.StatusInternalServerError, APICursorResponse{
-				Status:  "error",
-				Message: fmt.Sprintf("Cursor AI 실행 중 오류 발생: %v", err),
-				Output:  string(output),
-				JobID:   jobID,
-			})
-			return
+		// DB에서 작업 완료 대기 (폴링)
+		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				c.JSON(http.StatusRequestTimeout, APICursorResponse{
+					Status:  "timeout",
+					Message: "작업이 시간 내에 완료되지 않았습니다. GET /api/jobs/{id}로 결과를 조회하세요.",
+					JobID:   jobID,
+				})
+				return
+
+			case <-ticker.C:
+				jobRecord, err := cfg.DB.GetJob(jobID)
+				if err != nil {
+					log.Printf("[%s] 작업 조회 오류: %v", jobID, err)
+					continue
+				}
+
+				if jobRecord == nil {
+					continue
+				}
+
+				// 작업 완료 확인
+				if jobRecord.Status == database.JobStatusCompleted {
+					c.JSON(http.StatusOK, APICursorResponse{
+						Status:  "success",
+						Message: "Cursor AI 작업이 완료되었습니다.",
+						Output:  jobRecord.Output,
+						JobID:   jobID,
+					})
+					return
+				}
+
+				if jobRecord.Status == database.JobStatusFailed {
+					c.JSON(http.StatusInternalServerError, APICursorResponse{
+						Status:  "error",
+						Message: fmt.Sprintf("Cursor AI 실행 중 오류 발생: %s", jobRecord.Error),
+						Output:  jobRecord.Output,
+						JobID:   jobID,
+					})
+					return
+				}
+
+				// pending 또는 running 상태면 계속 대기
+			}
 		}
-
-		log.Printf("[%s] API 동기 실행 완료", jobID)
-		// v1.3: 성공 결과 저장
-		cfg.DB.UpdateJobResult(jobID, string(output), "")
-		cfg.DB.UpdateJobStatus(jobID, database.JobStatusCompleted)
-		
-		c.JSON(http.StatusOK, APICursorResponse{
-			Status:  "success",
-			Message: "Cursor AI 작업이 완료되었습니다.",
-			Output:  string(output),
-			JobID:   jobID,
-		})
 	}
 }
 
-// executeCursorTask는 비동기적으로 cursor-agent를 실행하고 결과를 Slack에 전송합니다.
-// v1.1: 자연어 프롬프트 방식으로 단순화
-// v1.2: 동적 프로젝트 경로 지원
-// v1.3: DB에 작업 결과 저장
-func executeCursorTask(jobID string, payload SlackCommandPayload, cfg *Config) {
-	log.Printf("[%s] 작업 시작: user=%s, text=%s", jobID, payload.UserName, payload.Text)
-
-	// 1. 프롬프트 추출 (v1.1: 단순화)
-	prompt := strings.TrimSpace(payload.Text)
-
-	if prompt == "" {
-		errMsg := "❌ 프롬프트가 비어있습니다. 사용법: /cursor \"자연어 프롬프트\"\n예시: /cursor \"main.go의 버그를 수정해줘\""
-		log.Printf("[%s] %s", jobID, errMsg)
-		sendDelayedResponse(payload.ResponseURL, errMsg, cfg.AllowedResponseDomains)
-		return
-	}
-
-	// 1.5. 프로젝트 경로 확인 (v1.2)
-	projectPath, isSet := cfg.GetProjectPath()
-	if !isSet {
-		errMsg := "❌ 프로젝트 경로가 설정되지 않았습니다.\n" +
-			"먼저 `/cursor set-path <프로젝트_경로>` 명령어로 경로를 설정해주세요.\n" +
-			"예시: `/cursor set-path /Users/username/projects/my-project`"
-		log.Printf("[%s] %s", jobID, errMsg)
-		sendDelayedResponse(payload.ResponseURL, errMsg, cfg.AllowedResponseDomains)
-		return
-	}
-
-	// v1.3: DB에 작업 생성
-	jobRecord := &database.JobRecord{
-		ID:          jobID,
-		Prompt:      prompt,
-		ProjectPath: projectPath,
-		Status:      database.JobStatusPending,
-		UserID:      payload.UserID,
-		UserName:    payload.UserName,
-		CreatedAt:   time.Now(),
-	}
-	if err := cfg.DB.CreateJob(jobRecord); err != nil {
-		log.Printf("[%s] DB 작업 생성 실패: %v", jobID, err)
-	}
-
-	// 작업 시작
-	cfg.DB.UpdateJobStatus(jobID, database.JobStatusRunning)
-
-	// 2. cursor-agent 실행 (v1.1: --force 추가, --files 제거)
-	output, err := executeCursorCLI(jobID, prompt, projectPath, cfg.CursorCLIPath)
-
-	// 3. 결과 포맷팅 (마크다운 적용)
-	rawOutput := string(output)
-	var messages []string
-	
-	if err != nil {
-		log.Printf("[%s] 실행 오류: %v, output: %s", jobID, err, rawOutput)
-		
-		// v1.3: 실패 결과 저장
-		cfg.DB.UpdateJobResult(jobID, rawOutput, err.Error())
-		cfg.DB.UpdateJobStatus(jobID, database.JobStatusFailed)
-		
-		// 에러 메시지 포맷팅
-		messages = formatErrorOutput(jobID, err, rawOutput)
-	} else {
-		log.Printf("[%s] 실행 완료", jobID)
-		
-		// v1.3: 성공 결과 저장
-		cfg.DB.UpdateJobResult(jobID, rawOutput, "")
-		cfg.DB.UpdateJobStatus(jobID, database.JobStatusCompleted)
-		
-		// 성공 메시지 포맷팅
-		messages = formatSuccessOutput(jobID, rawOutput, prompt)
-	}
-
-	// 4. 결과 전송 (SSRF 방어 추가, 마크다운 적용, 분할 전송)
-	sendMultipleMessages(payload.ResponseURL, messages, jobID, cfg.AllowedResponseDomains)
-}
-
-
-// executeCursorCLI는 cursor-agent를 안전하게 실행합니다.
-// v1.1: --force 플래그 추가, --files 제거, Process Group 관리
-func executeCursorCLI(jobID string, prompt string, projectPath string, cursorCLIPath string) ([]byte, error) {
-	// 1. 타임아웃 컨텍스트 생성 (15분)
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
-	defer cancel()
-
-	// 2. 명령어 인자 생성 (v1.1: --force 필수, --files 제거)
-	args := []string{
-		"-p", prompt,              // 자연어 프롬프트 (파일명 포함)
-		"--force",                 // 파일 수정 허용 (필수!)
-		"--output-format", "text", // 텍스트 출력
-	}
-
-	cmd := exec.CommandContext(ctx, cursorCLIPath, args...)
-
-	// 3. (보안) 작업 디렉토리 격리
-	cmd.Dir = projectPath
-
-	// 4. (보안 핵심) 자식 프로세스까지 함께 종료하기 위해 Process Group 설정
-	// 타임아웃 시 좀비 프로세스 방지
-	SetupProcessGroup(cmd)
-
-	log.Printf("[%s] Executing: %s %s (in %s)", jobID, cursorCLIPath, strings.Join(args, " "), cmd.Dir)
-
-	// 5. 실행 및 결과 수집 (stdout + stderr)
-	var outb, errb bytes.Buffer
-	cmd.Stdout = &outb
-	cmd.Stderr = &errb
-
-	err := cmd.Start()
-	if err != nil {
-		return nil, fmt.Errorf("명령어 시작 실패: %w", err)
-	}
-
-	// 5.5. cmd.Wait()를 별도 goroutine에서 실행하고 타임아웃과 동시에 처리
-	done := make(chan error, 1)
-	go func() {
-		done <- cmd.Wait()
-	}()
-
-	// 타임아웃 또는 완료 대기
-	select {
-	case <-ctx.Done():
-		// 타임아웃 발생 - 프로세스 그룹 강제 종료
-		log.Printf("[%s] 작업 시간 초과 (15분). 프로세스 그룹 강제 종료 시도...", jobID)
-		if err := KillProcessGroup(cmd); err != nil {
-			log.Printf("[%s] 프로세스 종료 실패: %v", jobID, err)
-		}
-		// cmd.Wait()가 완료될 때까지 잠시 대기 (최대 2초)
-		select {
-		case <-done:
-			// 프로세스가 종료됨
-		case <-time.After(2 * time.Second):
-			// 강제 종료 후에도 종료되지 않으면 로그만 남김
-			log.Printf("[%s] 프로세스 종료 대기 시간 초과", jobID)
-		}
-		// 출력 결합
-		combinedOutput := append(outb.Bytes(), errb.Bytes()...)
-		return combinedOutput, fmt.Errorf("명령어 실행 시간 초과 (15분)")
-
-	case err = <-done:
-		// 정상 완료 또는 에러
-		// 출력 결합
-		combinedOutput := append(outb.Bytes(), errb.Bytes()...)
-		if err != nil {
-			return combinedOutput, fmt.Errorf("cursor-agent 실행 실패: %w", err)
-		}
-		return combinedOutput, nil
-	}
-}
+// v1.4: executeCursorTask 함수는 제거됨
+// 이제 Worker Pool의 TaskExecutor가 작업을 처리합니다.
+// executeCursorCLI 함수도 TaskExecutor로 이동되었습니다.
 
 // formatSuccessOutput은 cursor-agent 성공 출력을 Slack 마크다운으로 포맷팅합니다.
 // 반환값: 메시지 배열 (40,000자씩 분할)
@@ -461,9 +346,10 @@ func formatSuccessOutput(jobID string, rawOutput string, prompt string) []string
 		result.WriteString("\n")
 	}
 	
-	// 원본 출력 (마크다운 렌더링을 위해 코드블록 제거)
+	// 원본 출력 (마크다운 → Slack mrkdwn 변환)
 	result.WriteString("📄 *실행 결과*\n")
-	result.WriteString(rawOutput)
+	slackFormattedOutput := convertMarkdownToSlack(rawOutput)
+	result.WriteString(slackFormattedOutput)
 	result.WriteString(fmt.Sprintf("\n\n🆔 Job ID: `%s`", jobID[:8]))
 	
 	// 메시지를 40,000자 단위로 분할
@@ -479,9 +365,10 @@ func formatErrorOutput(jobID string, err error, rawOutput string) []string {
 	
 	if rawOutput != "" {
 		result.WriteString("📄 *출력 내용*\n")
-		result.WriteString("```\n")
-		result.WriteString(rawOutput)
-		result.WriteString("\n```\n")
+		// 에러 출력도 Slack 형식으로 변환
+		slackFormattedOutput := convertMarkdownToSlack(rawOutput)
+		result.WriteString(slackFormattedOutput)
+		result.WriteString("\n")
 	}
 	
 	result.WriteString(fmt.Sprintf("\n💡 자세한 정보: `/cursor show %s`", jobID[:8]))
@@ -582,6 +469,124 @@ func stringSliceContains(slice []string, item string) bool {
 	return false
 }
 
+// convertMarkdownToSlack은 표준 마크다운을 Slack mrkdwn 형식으로 변환합니다.
+func convertMarkdownToSlack(markdown string) string {
+	lines := strings.Split(markdown, "\n")
+	var result strings.Builder
+	inCodeBlock := false
+	
+	for _, line := range lines {
+		// 코드 블록 시작/종료 감지
+		if strings.HasPrefix(strings.TrimSpace(line), "```") {
+			inCodeBlock = !inCodeBlock
+			result.WriteString(line)
+			result.WriteString("\n")
+			continue
+		}
+		
+		// 코드 블록 내부는 변환하지 않음
+		if inCodeBlock {
+			result.WriteString(line)
+			result.WriteString("\n")
+			continue
+		}
+		
+		// 1. 마크다운 제목 → Slack 볼드
+		// ### Title → *Title*
+		// ## Title → *Title*
+		// # Title → *Title*
+		if strings.HasPrefix(strings.TrimSpace(line), "#") {
+			// 제목 레벨 추출
+			trimmed := strings.TrimSpace(line)
+			level := 0
+			for i, ch := range trimmed {
+				if ch == '#' {
+					level++
+				} else {
+					trimmed = strings.TrimSpace(trimmed[i:])
+					break
+				}
+			}
+			
+			// Slack 볼드로 변환 (레벨에 따라 이모지 추가)
+			var prefix string
+			switch level {
+			case 1:
+				prefix = "📌 *" // H1
+			case 2:
+				prefix = "▪️ *" // H2
+			case 3:
+				prefix = "  • *" // H3
+			default:
+				prefix = "    - *" // H4+
+			}
+			result.WriteString(prefix + trimmed + "*\n")
+			continue
+		}
+		
+		// 2. 볼드: **text** → *text*
+		line = strings.ReplaceAll(line, "**", "*")
+		
+		// 3. 마크다운 링크: [text](url) → <url|text>
+		line = convertMarkdownLinks(line)
+		
+		// 4. 리스트 항목 정리 (마크다운 - 또는 * → Slack 불릿)
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "- ") {
+			// 들여쓰기 유지
+			indent := len(line) - len(strings.TrimLeft(line, " \t"))
+			line = strings.Repeat(" ", indent) + "• " + trimmed[2:]
+		} else if strings.HasPrefix(trimmed, "* ") && !strings.HasPrefix(trimmed, "**") {
+			indent := len(line) - len(strings.TrimLeft(line, " \t"))
+			line = strings.Repeat(" ", indent) + "• " + trimmed[2:]
+		}
+		
+		result.WriteString(line)
+		result.WriteString("\n")
+	}
+	
+	return result.String()
+}
+
+// convertMarkdownLinks는 마크다운 링크 [text](url)를 Slack 형식 <url|text>로 변환합니다.
+func convertMarkdownLinks(text string) string {
+	// [text](url) 패턴을 찾아서 변환
+	result := text
+	
+	// 간단한 구현: [로 시작하는 패턴 찾기
+	for {
+		start := strings.Index(result, "[")
+		if start == -1 {
+			break
+		}
+		
+		end := strings.Index(result[start:], "](")
+		if end == -1 {
+			break
+		}
+		end += start
+		
+		urlStart := end + 2
+		urlEnd := strings.Index(result[urlStart:], ")")
+		if urlEnd == -1 {
+			break
+		}
+		urlEnd += urlStart
+		
+		// 추출
+		linkText := result[start+1 : end]
+		url := result[urlStart:urlEnd]
+		
+		// Slack 형식으로 변환
+		slackLink := fmt.Sprintf("<%s|%s>", url, linkText)
+		
+		// 교체
+		result = result[:start] + slackLink + result[urlEnd+1:]
+	}
+	
+	return result
+}
+
 // splitMessage는 메시지를 Slack 최대 크기(40,000자)로 분할합니다.
 func splitMessage(message string) []string {
 	const maxSlackMessageSize = 40000
@@ -680,7 +685,7 @@ func sendDelayedResponse(responseURL string, message string, allowedDomains []st
 	}
 
 	// 4. Slack 응답 전송
-	payload := SlackDelayedResponse{
+	payload := types.SlackDelayedResponse{
 		Text:         message,
 		ResponseType: "in_channel", // 채널에 공개
 	}
