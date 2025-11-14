@@ -65,8 +65,11 @@ func (d *Dispatcher) dispatch() {
 
 // Stop은 모든 작업자와 디스패처를 우아하게 종료합니다.
 func (d *Dispatcher) Stop() {
-	log.Println("디스패처 종료 신호 수신...")
+	log.Println("   디스패처 종료 신호 전송 중...")
 	close(d.quit)
+	
+	log.Printf("   %d개 작업자 종료 대기 중...", d.maxWorkers)
 	d.wg.Wait()
-	log.Println("모든 작업자가 중지되었습니다.")
+	
+	log.Printf("   ✅ %d개 작업자 모두 종료됨", d.maxWorkers)
 }

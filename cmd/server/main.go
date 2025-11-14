@@ -203,7 +203,7 @@ func main() {
 	if dbErr != nil {
 		log.Fatalf("데이터베이스 초기화 실패: %v", dbErr)
 	}
-	defer db.Close()
+	// defer db.Close() 제거 - graceful shutdown에서 명시적으로 닫음
 	
 	log.Println()
 	log.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
@@ -248,6 +248,23 @@ func main() {
 		config.SetProjectPath(projectPath)
 	}
 
+	// v1.4: 포트 사용 가능 여부 확인 및 정리
+	log.Printf("🔍 포트 %s 사용 가능 여부 확인 중...", port)
+	autoKill := os.Getenv("AUTO_KILL_PORT") == "true" // 환경변수로 자동 종료 설정
+	if err := server.EnsurePortAvailable(port, autoKill); err != nil {
+		log.Printf("❌ 포트 사용 불가: %v", err)
+		log.Println()
+		log.Println("💡 해결 방법:")
+		log.Println("   1. 기존 서버를 종료하세요")
+		log.Println("   2. 또는 다른 포트를 사용하세요 (환경변수 PORT 설정)")
+		if !autoKill {
+			log.Println("   3. AUTO_KILL_PORT=true로 설정하면 자동으로 기존 프로세스를 종료합니다")
+		}
+		os.Exit(1)
+	}
+	log.Println("✅ 포트 사용 가능")
+	log.Println()
+
 	// 라우터 설정
 	router := server.SetupRouter(config)
 
@@ -269,8 +286,12 @@ func main() {
 
 	// 서버를 별도 goroutine에서 시작
 	srv := &http.Server{
-		Addr:    ":" + port,
-		Handler: router,
+		Addr:              ":" + port,
+		Handler:           router,
+		ReadTimeout:       15 * time.Minute, // 작업 타임아웃과 동일
+		WriteTimeout:      15 * time.Minute,
+		IdleTimeout:       60 * time.Second,
+		ReadHeaderTimeout: 10 * time.Second,
 	}
 
 	go func() {
@@ -286,27 +307,62 @@ func main() {
 	<-quit
 
 	log.Println("🛑 서버를 종료합니다...")
+	log.Println("1️⃣ 새로운 HTTP 요청 차단 중...")
 
-	// v1.4: Worker Pool 종료
-	if config.Dispatcher != nil {
-		config.Dispatcher.Stop()
+	// 1. HTTP 서버 graceful shutdown (새 요청 차단, 기존 요청은 처리)
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
+
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("⚠️  HTTP 서버 종료 중 오류: %v", err)
+	} else {
+		log.Println("✅ HTTP 서버 종료 완료")
 	}
 
-	// ngrok 종료
-	if ngrokManager != nil {
-		if err := ngrokManager.Stop(); err != nil {
-			log.Printf("⚠️  ngrok 종료 중 오류: %v", err)
+	// 2. JobQueue 닫기 (새 작업 수신 중단)
+	log.Println("2️⃣ 작업 큐 닫는 중...")
+	close(config.JobQueue)
+	log.Println("✅ 작업 큐 닫힘 (새 작업 수신 중단)")
+
+	// 3. Worker Pool 종료 (진행 중인 작업 완료 대기)
+	log.Println("3️⃣ 진행 중인 작업 완료 대기 중...")
+	if config.Dispatcher != nil {
+		// 별도 goroutine에서 종료 대기 (타임아웃 적용)
+		workerDone := make(chan struct{})
+		go func() {
+			config.Dispatcher.Stop()
+			close(workerDone)
+		}()
+
+		// 최대 30초 대기 (작업이 길 수 있으므로)
+		select {
+		case <-workerDone:
+			log.Println("✅ 모든 작업자 종료 완료")
+		case <-time.After(30 * time.Second):
+			log.Println("⚠️  작업자 종료 시간 초과 (30초) - 강제 종료")
 		}
 	}
 
-	// 서버 graceful shutdown (최대 5초)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	if err := srv.Shutdown(ctx); err != nil {
-		log.Printf("⚠️  서버 강제 종료: %v", err)
+	// 4. ngrok 종료
+	log.Println("4️⃣ ngrok 터널 종료 중...")
+	if ngrokManager != nil {
+		if err := ngrokManager.Stop(); err != nil {
+			log.Printf("⚠️  ngrok 종료 중 오류: %v", err)
+		} else {
+			log.Println("✅ ngrok 터널 종료 완료")
+		}
 	}
 
-	log.Println("✅ 정리 완료")
+	// 5. DB 연결 닫기 (defer 대신 명시적으로)
+	log.Println("5️⃣ 데이터베이스 연결 종료 중...")
+	if err := db.Close(); err != nil {
+		log.Printf("⚠️  데이터베이스 종료 중 오류: %v", err)
+	} else {
+		log.Println("✅ 데이터베이스 연결 종료 완료")
+	}
+
+	log.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+	log.Println("✅ 모든 리소스 정리 완료 - 서버 종료")
+	log.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 }
 

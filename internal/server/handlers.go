@@ -167,6 +167,13 @@ func HandleSlashCursor(cfg *Config) gin.HandlerFunc {
 
 		// 비동기로 큐에 제출 (큐가 가득 차면 블록될 수 있음)
 		go func() {
+			// 서버 종료 시 JobQueue가 닫힐 수 있으므로 panic 방지
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("[%s] ⚠️ 작업 큐가 닫혀서 제출 실패: %v", jobID, r)
+				}
+			}()
+			
 			cfg.JobQueue <- job
 			log.Printf("[%s] 작업이 큐에 제출되었습니다.", jobID)
 		}()
@@ -242,6 +249,13 @@ func HandleAPICursor(cfg *Config) gin.HandlerFunc {
 
 		// 비동기로 큐에 제출
 		go func() {
+			// 서버 종료 시 JobQueue가 닫힐 수 있으므로 panic 방지
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("[%s] ⚠️ 작업 큐가 닫혀서 제출 실패: %v", jobID, r)
+				}
+			}()
+			
 			cfg.JobQueue <- job
 			log.Printf("[%s] API 작업이 큐에 제출되었습니다.", jobID)
 		}()
