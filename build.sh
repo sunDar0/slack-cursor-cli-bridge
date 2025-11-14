@@ -26,8 +26,6 @@ LDFLAGS="-s -w -X main.Version=$VERSION -X main.BuildTime=$BUILD_TIME"
 PLATFORMS=(
     "darwin/amd64"   # macOS Intel
     "darwin/arm64"   # macOS Apple Silicon (M1/M2/M3)
-    "linux/amd64"    # Linux x86_64
-    "linux/arm64"    # Linux ARM64
     "windows/amd64"  # Windows x86_64
 )
 
@@ -55,6 +53,8 @@ for platform in "${PLATFORMS[@]}"; do
         cmd/server/main.go 2>&1 | grep -v "warning" || true
     
     if [ $? -eq 0 ] && [ -f "$BUILD_DIR/$OUTPUT_NAME" ]; then
+        # 실행 권한 부여
+        chmod +x "$BUILD_DIR/$OUTPUT_NAME"
         SIZE=$(du -h "$BUILD_DIR/$OUTPUT_NAME" | cut -f1)
         echo "   ✅ 완료: $OUTPUT_NAME ($SIZE)"
     else
@@ -85,6 +85,8 @@ for platform in "${PLATFORMS[@]}"; do
             cmd/server/main.go 2>&1 | grep -v "warning" || true
         
         if [ $? -eq 0 ] && [ -f "$BUILD_DIR/$OUTPUT_NAME" ]; then
+            # 실행 권한 부여
+            chmod +x "$BUILD_DIR/$OUTPUT_NAME"
             SIZE=$(du -h "$BUILD_DIR/$OUTPUT_NAME" | cut -f1)
             echo "   ✅ 완료: $OUTPUT_NAME ($SIZE)"
         else
@@ -101,6 +103,8 @@ for platform in "${PLATFORMS[@]}"; do
             cmd/server/main.go 2>&1 | grep -v "warning" || true
         
         if [ $? -eq 0 ] && [ -f "$BUILD_DIR/$OUTPUT_NAME" ]; then
+            # 실행 권한 부여
+            chmod +x "$BUILD_DIR/$OUTPUT_NAME"
             SIZE=$(du -h "$BUILD_DIR/$OUTPUT_NAME" | cut -f1)
             echo "   ✅ 완료: $OUTPUT_NAME ($SIZE)"
         else
@@ -128,8 +132,6 @@ echo "💡 사용 방법:"
 echo "   각 플랫폼에 맞는 파일을 전달하세요:"
 echo "   - macOS Intel:     slack-cursor-hook-darwin-amd64"
 echo "   - macOS M1/M2/M3:  slack-cursor-hook-darwin-arm64"
-echo "   - Linux x86_64:    slack-cursor-hook-linux-amd64"
-echo "   - Linux ARM64:     slack-cursor-hook-linux-arm64"
 echo "   - Windows:         slack-cursor-hook-windows-amd64.exe"
 echo
 echo "⚠️  참고: SQLite는 CGO가 필요합니다."
