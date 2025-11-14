@@ -59,8 +59,18 @@ go run cmd/server/main.go --setup
 ### 4단계: 서버 시작
 
 ```bash
+조# 개발용 스크립트 (서버 + ngrok + 로그)
 ./start-dev.sh
+
+# 또는 실행 파일 직접 실행 (ngrok 자동 실행!)
+./실행파일
 ```
+
+**자동으로 수행되는 작업:**
+- ✅ 서버 시작 (포트 8080)
+- ✅ ngrok 터널 생성 (설치되어 있는 경우)
+- ✅ ngrok URL 자동 출력
+- ✅ Slack App 설정 방법 안내
 
 설정 마법사 실행 후 Slack App 설정만 완료하면 바로 사용할 수 있습니다!
 ([Slack App 설정](#slack-app-설정) 참조)
