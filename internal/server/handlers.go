@@ -101,22 +101,57 @@ func HandleSlashCursor(cfg *Config) gin.HandlerFunc {
 			return
 		}
 
-		// v1.2: set-path 커맨드 처리
+		// 명령어 처리
 		text := strings.TrimSpace(payload.Text)
-		if strings.HasPrefix(text, "set-path ") {
-			// set-path 커맨드 처리
-			path := strings.TrimSpace(strings.TrimPrefix(text, "set-path "))
-			if path == "" {
+		
+		// 명령어 파싱
+		parts := strings.Fields(text)
+		if len(parts) == 0 {
+			c.JSON(http.StatusOK, gin.H{
+				"response_type": "ephemeral",
+				"text":          "❌ 명령어 또는 프롬프트를 입력해주세요.\n💡 도움말: `/cursor help`",
+			})
+			return
+		}
+		
+		command := parts[0]
+		
+		// 명령어별 처리
+		switch command {
+		case "help", "?":
+			handleHelpCommand(c)
+			return
+			
+		case "list", "jobs":
+			handleListCommand(c, cfg, payload.UserID)
+			return
+			
+		case "show", "result":
+			if len(parts) < 2 {
+				c.JSON(http.StatusOK, gin.H{
+					"response_type": "ephemeral",
+					"text":          "❌ Job ID를 입력해주세요.\n사용법: `/cursor show <job-id>`",
+				})
+				return
+			}
+			handleShowCommand(c, cfg, parts[1])
+			return
+			
+		case "path", "get-path":
+			handlePathCommand(c, cfg)
+			return
+			
+		case "set-path":
+			if len(parts) < 2 {
 				c.JSON(http.StatusOK, gin.H{
 					"response_type": "ephemeral",
 					"text":          "❌ 경로를 입력해주세요.\n사용법: `/cursor set-path /path/to/project`",
 				})
 				return
 			}
-
+			path := strings.TrimSpace(strings.TrimPrefix(text, "set-path "))
 			cfg.SetProjectPath(path)
 			log.Printf("[%s] Slack을 통해 프로젝트 경로 설정: %s", payload.UserID, path)
-
 			c.JSON(http.StatusOK, gin.H{
 				"response_type": "ephemeral",
 				"text":          fmt.Sprintf("✅ 프로젝트 경로가 설정되었습니다:\n`%s`\n\n이제 `/cursor \"프롬프트\"` 명령어를 사용할 수 있습니다.", path),
@@ -573,6 +608,242 @@ func HandleListJobs(cfg *Config) gin.HandlerFunc {
 		}
 
 		c.JSON(http.StatusOK, jobs)
+	}
+}
+
+// Slack 명령어 핸들러 함수들
+
+// handleHelpCommand shows available commands
+func handleHelpCommand(c *gin.Context) {
+	helpText := "📚 *Cursor AI 사용 가이드*\n\n" +
+		"*🎯 코드 작업 요청:*\n" +
+		"`/cursor \"프롬프트\"`\n" +
+		"예: `/cursor \"main.go의 버그를 수정해줘\"`\n\n" +
+		"*🔧 설정 명령어:*\n" +
+		"• `/cursor set-path <경로>` - 프로젝트 경로 설정\n" +
+		"• `/cursor path` - 현재 프로젝트 경로 확인\n\n" +
+		"*📋 작업 조회:*\n" +
+		"• `/cursor list` - 최근 작업 목록 보기 (최근 10개)\n" +
+		"• `/cursor show <job-id>` - 특정 작업 결과 상세 보기\n\n" +
+		"*❓ 도움말:*\n" +
+		"• `/cursor help` - 이 도움말 표시\n\n" +
+		"💡 *사용 팁:*\n" +
+		"1. 처음 사용 시 `set-path`로 프로젝트 경로 설정\n" +
+		"2. 자연어로 편하게 요청하세요\n" +
+		"3. 작업 ID는 `list` 명령어로 확인 가능"
+
+	c.JSON(http.StatusOK, gin.H{
+		"response_type": "ephemeral",
+		"text":          helpText,
+	})
+}
+
+// handleListCommand shows recent jobs
+func handleListCommand(c *gin.Context, cfg *Config, userID string) {
+	if cfg.DB == nil {
+		c.JSON(http.StatusOK, gin.H{
+			"response_type": "ephemeral",
+			"text":          "❌ 데이터베이스가 초기화되지 않았습니다.",
+		})
+		return
+	}
+
+	// Get user's recent jobs (최근 10개)
+	jobs, err := cfg.DB.ListJobs(10, 0, "")
+	if err != nil {
+		log.Printf("작업 목록 조회 실패: %v", err)
+		c.JSON(http.StatusOK, gin.H{
+			"response_type": "ephemeral",
+			"text":          "❌ 작업 목록을 가져오는 중 오류가 발생했습니다.",
+		})
+		return
+	}
+
+	if len(jobs) == 0 {
+		c.JSON(http.StatusOK, gin.H{
+			"response_type": "ephemeral",
+			"text":          "📋 아직 실행된 작업이 없습니다.\n\n💡 사용법: `/cursor \"프롬프트\"`",
+		})
+		return
+	}
+
+	// Build response
+	var response strings.Builder
+	response.WriteString("📋 *최근 작업 목록* (최근 10개)\n\n")
+
+	for _, job := range jobs {
+		// Status emoji
+		var statusEmoji string
+		switch job.Status {
+		case "completed":
+			statusEmoji = "✅"
+		case "failed":
+			statusEmoji = "❌"
+		case "running":
+			statusEmoji = "⏳"
+		case "pending":
+			statusEmoji = "🕐"
+		default:
+			statusEmoji = "❓"
+		}
+
+		// Time ago
+		timeAgo := timeAgoString(job.CreatedAt)
+		
+		// Truncate prompt if too long
+		prompt := job.Prompt
+		if len(prompt) > 50 {
+			prompt = prompt[:47] + "..."
+		}
+
+		response.WriteString(fmt.Sprintf("%s `%s` - \"%s\" (%s)\n", 
+			statusEmoji, job.ID[:8], prompt, timeAgo))
+	}
+
+	response.WriteString("\n💡 *결과 확인:* `/cursor show <job-id>`")
+
+	c.JSON(http.StatusOK, gin.H{
+		"response_type": "ephemeral",
+		"text":          response.String(),
+	})
+}
+
+// handleShowCommand shows job details
+func handleShowCommand(c *gin.Context, cfg *Config, jobID string) {
+	if cfg.DB == nil {
+		c.JSON(http.StatusOK, gin.H{
+			"response_type": "ephemeral",
+			"text":          "❌ 데이터베이스가 초기화되지 않았습니다.",
+		})
+		return
+	}
+
+	job, err := cfg.DB.GetJob(jobID)
+	if err != nil {
+		log.Printf("작업 조회 실패 (%s): %v", jobID, err)
+		c.JSON(http.StatusOK, gin.H{
+			"response_type": "ephemeral",
+			"text":          fmt.Sprintf("❌ 작업을 찾을 수 없습니다: `%s`", jobID),
+		})
+		return
+	}
+
+	// Status emoji and text
+	var statusEmoji, statusText string
+	switch job.Status {
+	case "completed":
+		statusEmoji = "✅"
+		statusText = "완료"
+	case "failed":
+		statusEmoji = "❌"
+		statusText = "실패"
+	case "running":
+		statusEmoji = "⏳"
+		statusText = "실행 중"
+	case "pending":
+		statusEmoji = "🕐"
+		statusText = "대기 중"
+	default:
+		statusEmoji = "❓"
+		statusText = "알 수 없음"
+	}
+
+	// Build response
+	var response strings.Builder
+	response.WriteString(fmt.Sprintf("📦 *작업 결과* (ID: `%s`)\n\n", job.ID[:8]))
+	response.WriteString(fmt.Sprintf("*프롬프트:* \"%s\"\n", job.Prompt))
+	response.WriteString(fmt.Sprintf("*상태:* %s %s\n", statusEmoji, statusText))
+	response.WriteString(fmt.Sprintf("*실행 시간:* %s\n", job.CreatedAt.Format("2006-01-02 15:04:05")))
+	
+	if job.StartedAt != nil && !job.StartedAt.IsZero() {
+		duration := time.Since(*job.StartedAt)
+		response.WriteString(fmt.Sprintf("*소요 시간:* %s\n", duration.Round(time.Second)))
+	}
+
+	// Output or error
+	if job.Status == "completed" && job.Output != "" {
+		output := job.Output
+		if len(output) > 1000 {
+			output = output[:997] + "..."
+		}
+		response.WriteString(fmt.Sprintf("\n📝 *출력:*\n```\n%s\n```", output))
+	} else if job.Status == "failed" && job.Error != "" {
+		response.WriteString(fmt.Sprintf("\n❌ *오류:*\n```\n%s\n```", job.Error))
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"response_type": "ephemeral",
+		"text":          response.String(),
+	})
+}
+
+// handlePathCommand shows current project path
+func handlePathCommand(c *gin.Context, cfg *Config) {
+	path, isSet := cfg.GetProjectPath()
+	
+	if !isSet || path == "" {
+		c.JSON(http.StatusOK, gin.H{
+			"response_type": "ephemeral",
+			"text":          "❌ 프로젝트 경로가 설정되지 않았습니다.\n\n💡 설정하기: `/cursor set-path /path/to/project`",
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"response_type": "ephemeral",
+		"text":          fmt.Sprintf("📁 *현재 프로젝트 경로*\n`%s`\n\n💡 변경하기: `/cursor set-path <새경로>`", path),
+	})
+}
+
+// timeAgoString returns a human-readable time ago string
+func timeAgoString(t time.Time) string {
+	duration := time.Since(t)
+	
+	if duration < time.Minute {
+		return "방금 전"
+	} else if duration < time.Hour {
+		return fmt.Sprintf("%d분 전", int(duration.Minutes()))
+	} else if duration < 24*time.Hour {
+		return fmt.Sprintf("%d시간 전", int(duration.Hours()))
+	} else {
+		return fmt.Sprintf("%d일 전", int(duration.Hours()/24))
+	}
+}
+
+// Slack Options API for autocomplete
+
+type SlackOption struct {
+	Text  string `json:"text"`
+	Value string `json:"value"`
+}
+
+type SlackOptionsResponse struct {
+	Options []SlackOption `json:"options"`
+}
+
+// HandleSlackOptions provides autocomplete options for Slack commands
+func HandleSlackOptions(cfg *Config) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		// Parse the payload
+		var payload struct {
+			Value string `form:"value" json:"value"`
+		}
+		
+		if err := c.ShouldBind(&payload); err != nil {
+			c.JSON(http.StatusOK, SlackOptionsResponse{Options: []SlackOption{}})
+			return
+		}
+
+		// Provide command suggestions based on current input
+		options := []SlackOption{
+			{Text: "help - 도움말 보기", Value: "help"},
+			{Text: "list - 최근 작업 목록", Value: "list"},
+			{Text: "path - 현재 경로 확인", Value: "path"},
+			{Text: "set-path <경로> - 프로젝트 경로 설정", Value: "set-path "},
+			{Text: "show <job-id> - 작업 결과 보기", Value: "show "},
+		}
+
+		c.JSON(http.StatusOK, SlackOptionsResponse{Options: options})
 	}
 }
 
