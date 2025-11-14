@@ -38,15 +38,41 @@ func CheckCursorAgent() CheckResult {
 		return result
 	}
 
-	// Check default installation path
+	// Check default installation paths by OS
 	homeDir, _ := os.UserHomeDir()
-	defaultPath := fmt.Sprintf("%s/.local/bin/cursor-agent", homeDir)
+	var defaultPaths []string
 	
-	if _, err := os.Stat(defaultPath); err == nil {
-		result.Installed = true
-		result.Path = defaultPath
-		result.Message = "설치되어 있지만 PATH에 없습니다"
-		return result
+	osName := runtime.GOOS
+	switch osName {
+	case "windows":
+		// Windows 기본 경로들
+		defaultPaths = []string{
+			fmt.Sprintf("%s\\.local\\bin\\cursor-agent.exe", homeDir),
+			fmt.Sprintf("%s\\AppData\\Local\\Programs\\cursor-agent\\cursor-agent.exe", homeDir),
+			fmt.Sprintf("%s\\AppData\\Roaming\\cursor-agent\\cursor-agent.exe", homeDir),
+		}
+	case "darwin", "linux":
+		// macOS/Linux 기본 경로들
+		defaultPaths = []string{
+			fmt.Sprintf("%s/.local/bin/cursor-agent", homeDir),
+			"/usr/local/bin/cursor-agent",
+			"/opt/cursor-agent/cursor-agent",
+		}
+	default:
+		// 기타 Unix 계열
+		defaultPaths = []string{
+			fmt.Sprintf("%s/.local/bin/cursor-agent", homeDir),
+		}
+	}
+	
+	// 각 기본 경로 확인
+	for _, defaultPath := range defaultPaths {
+		if _, err := os.Stat(defaultPath); err == nil {
+			result.Installed = true
+			result.Path = defaultPath
+			result.Message = "설치되어 있지만 PATH에 없습니다"
+			return result
+		}
 	}
 
 	result.Message = "설치되지 않았습니다"
