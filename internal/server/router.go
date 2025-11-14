@@ -57,6 +57,9 @@ func SetupRouter(cfg *Config) *gin.Engine {
 
 		// 핸들러 바인딩
 		slackApi.POST("/cursor", HandleSlashCursor(cfg))
+		
+		// Options API for autocomplete
+		slackApi.POST("/cursor/options", HandleSlackOptions(cfg))
 	}
 
 	// 일반 API 엔드포인트 그룹 (인증 불필요 - 테스트/개발용)
