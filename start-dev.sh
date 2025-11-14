@@ -46,7 +46,8 @@ echo ""
 
 # 1. Go 서버 시작
 echo -e "${YELLOW}📦 Go 서버 시작 중...${NC}"
-go run cmd/server/main.go > "$SERVER_LOG" 2>&1 &
+# go run은 임시 디렉토리에서 실행되므로 DB_PATH를 명시적으로 지정
+DB_PATH="./data/jobs.db" go run cmd/server/main.go > "$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 echo $SERVER_PID > "$PIDS_FILE"
 echo -e "${GREEN}✅ Go 서버 시작됨 (PID: $SERVER_PID)${NC}"
@@ -103,8 +104,12 @@ echo -e "   • ngrok 대시보드: http://localhost:4040"
 echo -e "   • Health Check:  http://localhost:8080/health"
 echo ""
 echo -e "${BLUE}📋 사용 가능한 Slack 명령어:${NC}"
+echo -e "   ${YELLOW}/cursor help${NC}  - 도움말 및 전체 명령어 목록"
 echo -e "   ${YELLOW}/cursor set-path /path/to/project${NC}  - 프로젝트 경로 설정"
-echo -e "   ${YELLOW}/cursor 자연어 프롬프트${NC}            - 코드 작업 요청"
+echo -e "   ${YELLOW}/cursor path${NC}                       - 현재 경로 확인"
+echo -e "   ${YELLOW}/cursor list${NC}                       - 최근 작업 목록"
+echo -e "   ${YELLOW}/cursor show <job-id>${NC}              - 작업 결과 보기"
+echo -e "   ${YELLOW}/cursor \"프롬프트\"${NC}                  - 코드 작업 요청"
 echo ""
 echo -e "${RED}⚠️  종료하려면 Ctrl+C를 누르세요${NC}"
 echo ""
