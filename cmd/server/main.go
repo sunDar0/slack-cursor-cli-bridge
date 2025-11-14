@@ -1,13 +1,21 @@
 package main
 
 import (
+	"context"
 	"flag"
+	"io"
 	"log"
+	"net/http"
 	"os"
+	"os/signal"
+	"path/filepath"
+	"syscall"
+	"time"
 
 	"github.com/joho/godotenv"
 	_ "github.com/kakaovx/cursor-slack-server/docs" // Swagger docs
 	"github.com/kakaovx/cursor-slack-server/internal/database"
+	"github.com/kakaovx/cursor-slack-server/internal/ngrok"
 	"github.com/kakaovx/cursor-slack-server/internal/server"
 	"github.com/kakaovx/cursor-slack-server/internal/setup"
 )
@@ -54,11 +62,51 @@ func main() {
 		return
 	}
 
-	// .env 파일 로드 (파일이 없어도 에러는 무시)
-	if err := godotenv.Load(); err != nil {
-		log.Println("⚠️  .env 파일을 찾을 수 없습니다. 시스템 환경변수를 사용합니다.")
+	// 로그 파일 설정 (실행 파일과 같은 디렉토리)
+	exePath, err := os.Executable()
+	if err == nil {
+		exeDir := filepath.Dir(exePath)
+		logsDir := filepath.Join(exeDir, "logs")
+		
+		// logs 디렉토리 생성 (없으면)
+		if err := os.MkdirAll(logsDir, 0755); err == nil {
+			logFile := filepath.Join(logsDir, "server.log")
+			
+			// 로그 파일 열기 (append 모드)
+			f, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+			if err == nil {
+				// stdout과 파일 둘 다에 로그 출력
+				mw := io.MultiWriter(os.Stdout, f)
+				log.SetOutput(mw)
+				log.Printf("📝 로그 파일: %s", logFile)
+			}
+		}
+	}
+
+	// .env 파일 로드 (실행 파일과 같은 디렉토리 또는 현재 디렉토리)
+	// 1. 실행 파일과 같은 디렉토리에서 .env 찾기
+	exePath, exeErr := os.Executable()
+	if exeErr == nil {
+		exeDir := filepath.Dir(exePath)
+		envPath := filepath.Join(exeDir, ".env")
+		
+		if loadErr := godotenv.Load(envPath); loadErr == nil {
+			log.Printf("✅ .env 파일을 로드했습니다: %s", envPath)
+		} else {
+			// 2. 현재 작업 디렉토리에서 .env 찾기
+			if loadErr := godotenv.Load(); loadErr != nil {
+				log.Println("⚠️  .env 파일을 찾을 수 없습니다. 시스템 환경변수를 사용합니다.")
+			} else {
+				log.Println("✅ .env 파일을 로드했습니다: ./.env")
+			}
+		}
 	} else {
-		log.Println("✅ .env 파일을 로드했습니다.")
+		// 실행 파일 경로를 찾을 수 없는 경우
+		if loadErr := godotenv.Load(); loadErr != nil {
+			log.Println("⚠️  .env 파일을 찾을 수 없습니다. 시스템 환경변수를 사용합니다.")
+		} else {
+			log.Println("✅ .env 파일을 로드했습니다.")
+		}
 	}
 
 	// 환경변수 로드
@@ -86,11 +134,40 @@ func main() {
 
 	cursorCLIPath := os.Getenv("CURSOR_CLI_PATH")
 	if cursorCLIPath == "" {
-		// 기본값: PATH에서 cursor-agent 검색
-		cursorCLIPath = "cursor-agent"
-		log.Println("ℹ️  CURSOR_CLI_PATH가 설정되지 않았습니다. 기본값 사용: 'cursor-agent' (PATH에서 검색)")
-		log.Println("   💡 cursor-agent가 PATH에 없다면 .env에 CURSOR_CLI_PATH를 설정하세요.")
-		log.Println("      예: CURSOR_CLI_PATH=/Users/username/.local/bin/cursor-agent")
+		// cursor-agent 설치 확인
+		cursorResult := setup.CheckCursorAgent()
+		if cursorResult.Installed {
+			cursorCLIPath = cursorResult.Path
+			log.Printf("✅ cursor-agent 발견: %s", cursorResult.Path)
+			if cursorResult.Version != "" {
+				log.Printf("   버전: %s", cursorResult.Version)
+			}
+			if cursorResult.Message != "" {
+				log.Printf("   참고: %s", cursorResult.Message)
+			}
+		} else {
+			// 기본값: PATH에서 cursor-agent 검색
+			cursorCLIPath = "cursor-agent"
+			log.Println("⚠️  cursor-agent가 설치되지 않았습니다.")
+			log.Println("   기본값 사용: 'cursor-agent' (PATH에서 검색)")
+			log.Println()
+			log.Println("💡 cursor-agent 설치 방법:")
+			
+			osName := setup.GetOS()
+			if osName == "windows" {
+				log.Println("   Git Bash에서 실행:")
+				log.Println("   curl https://cursor.com/install -fsS | bash")
+			} else {
+				log.Println("   curl https://cursor.com/install -fsS | bash")
+			}
+			log.Println()
+			log.Println("   또는 .env에 CURSOR_CLI_PATH를 직접 설정:")
+			if osName == "windows" {
+				log.Println("   CURSOR_CLI_PATH=C:\\path\\to\\cursor-agent.exe")
+			} else {
+				log.Println("   CURSOR_CLI_PATH=/path/to/cursor-agent")
+			}
+		}
 	} else {
 		log.Printf("ℹ️  CURSOR_CLI_PATH 사용: %s", cursorCLIPath)
 	}
@@ -102,13 +179,35 @@ func main() {
 	// v1.3: SQLite 데이터베이스 초기화
 	dbPath := os.Getenv("DB_PATH")
 	if dbPath == "" {
-		dbPath = "./data/jobs.db" // 기본 경로
+		// 실행 파일 기준으로 DB 경로 설정
+		if exePath, err := os.Executable(); err == nil {
+			exeDir := filepath.Dir(exePath)
+			dbPath = filepath.Join(exeDir, "data", "jobs.db")
+		} else {
+			dbPath = "./data/jobs.db" // Fallback
+		}
 	}
-	db, err := database.NewDB(dbPath)
-	if err != nil {
-		log.Fatalf("데이터베이스 초기화 실패: %v", err)
+	
+	// 데이터베이스 디렉토리 생성 (없으면)
+	dbDir := filepath.Dir(dbPath)
+	if err := os.MkdirAll(dbDir, 0755); err != nil {
+		log.Fatalf("데이터베이스 디렉토리 생성 실패: %v", err)
+	}
+	
+	// 절대 경로로 변환하여 표시
+	absDbPath, _ := filepath.Abs(dbPath)
+	
+	db, dbErr := database.NewDB(dbPath)
+	if dbErr != nil {
+		log.Fatalf("데이터베이스 초기화 실패: %v", dbErr)
 	}
 	defer db.Close()
+	
+	log.Println()
+	log.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+	log.Printf("📦 데이터베이스 위치: %s", absDbPath)
+	log.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+	log.Println()
 
 	// 설정 정보를 담은 구조체 (v1.2: 동적 경로 관리, v1.3: DB 추가)
 	config := &server.Config{
@@ -127,10 +226,57 @@ func main() {
 	// 라우터 설정
 	router := server.SetupRouter(config)
 
-	// 서버 시작
-	log.Printf("서버를 포트 %s에서 시작합니다...", port)
-	if err := router.Run(":" + port); err != nil {
-		log.Fatalf("서버 시작 실패: %v", err)
+	// ngrok 시작 (선택사항)
+	var ngrokManager *ngrok.Manager
+	if ngrok.IsInstalled() {
+		ngrokManager = ngrok.NewManager(port)
+		log.Println("🌐 ngrok 터널 생성 중...")
+		
+		if err := ngrokManager.Start(); err != nil {
+			log.Printf("⚠️  ngrok 시작 실패: %v", err)
+			log.Println("서버는 로컬에서만 실행됩니다.")
+		} else {
+			ngrokManager.PrintInstructions()
+		}
+	} else {
+		ngrok.PrintNotInstalledWarning(port)
 	}
+
+	// 서버를 별도 goroutine에서 시작
+	srv := &http.Server{
+		Addr:    ":" + port,
+		Handler: router,
+	}
+
+	go func() {
+		log.Printf("🚀 서버를 포트 %s에서 시작합니다...", port)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("서버 시작 실패: %v", err)
+		}
+	}()
+
+	// Graceful shutdown 처리
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+
+	log.Println("🛑 서버를 종료합니다...")
+
+	// ngrok 종료
+	if ngrokManager != nil {
+		if err := ngrokManager.Stop(); err != nil {
+			log.Printf("⚠️  ngrok 종료 중 오류: %v", err)
+		}
+	}
+
+	// 서버 graceful shutdown (최대 5초)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Printf("⚠️  서버 강제 종료: %v", err)
+	}
+
+	log.Println("✅ 정리 완료")
 }
 
