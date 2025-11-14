@@ -332,34 +332,40 @@ func executeCursorTask(jobID string, payload SlackCommandPayload, cfg *Config) {
 	// 2. cursor-agent 실행 (v1.1: --force 추가, --files 제거)
 	output, err := executeCursorCLI(jobID, prompt, projectPath, cfg.CursorCLIPath)
 
-	// 3. 결과 포맷팅
-	resultMessage := string(output)
+	// 3. 결과 포맷팅 (마크다운 적용)
+	rawOutput := string(output)
+	var messages []string
+	
 	if err != nil {
-		log.Printf("[%s] 실행 오류: %v, output: %s", jobID, err, resultMessage)
-		resultMessage = fmt.Sprintf("❌ Cursor AI 실행 중 에러 발생:\n%v\n\n출력:\n%s", err, resultMessage)
+		log.Printf("[%s] 실행 오류: %v, output: %s", jobID, err, rawOutput)
 		
 		// v1.3: 실패 결과 저장
-		cfg.DB.UpdateJobResult(jobID, string(output), err.Error())
+		cfg.DB.UpdateJobResult(jobID, rawOutput, err.Error())
 		cfg.DB.UpdateJobStatus(jobID, database.JobStatusFailed)
+		
+		// 에러 메시지 포맷팅
+		messages = formatErrorOutput(jobID, err, rawOutput)
 	} else {
 		log.Printf("[%s] 실행 완료", jobID)
-		resultMessage = fmt.Sprintf("✅ Cursor AI 작업 완료:\n\n%s", resultMessage)
 		
 		// v1.3: 성공 결과 저장
-		cfg.DB.UpdateJobResult(jobID, string(output), "")
+		cfg.DB.UpdateJobResult(jobID, rawOutput, "")
 		cfg.DB.UpdateJobStatus(jobID, database.JobStatusCompleted)
+		
+		// 성공 메시지 포맷팅
+		messages = formatSuccessOutput(jobID, rawOutput, prompt)
 	}
 
-	// 4. 결과 전송 (SSRF 방어 추가)
-	sendDelayedResponse(payload.ResponseURL, "```\n"+resultMessage+"\n```", cfg.AllowedResponseDomains)
+	// 4. 결과 전송 (SSRF 방어 추가, 마크다운 적용, 분할 전송)
+	sendMultipleMessages(payload.ResponseURL, messages, jobID, cfg.AllowedResponseDomains)
 }
 
 
 // executeCursorCLI는 cursor-agent를 안전하게 실행합니다.
 // v1.1: --force 플래그 추가, --files 제거, Process Group 관리
 func executeCursorCLI(jobID string, prompt string, projectPath string, cursorCLIPath string) ([]byte, error) {
-	// 1. 타임아웃 컨텍스트 생성 (120초)
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	// 1. 타임아웃 컨텍스트 생성 (15분)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
 
 	// 2. 명령어 인자 생성 (v1.1: --force 필수, --files 제거)
@@ -376,7 +382,7 @@ func executeCursorCLI(jobID string, prompt string, projectPath string, cursorCLI
 
 	// 4. (보안 핵심) 자식 프로세스까지 함께 종료하기 위해 Process Group 설정
 	// 타임아웃 시 좀비 프로세스 방지
-	setupProcessGroup(cmd)
+	SetupProcessGroup(cmd)
 
 	log.Printf("[%s] Executing: %s %s (in %s)", jobID, cursorCLIPath, strings.Join(args, " "), cmd.Dir)
 
@@ -390,26 +396,257 @@ func executeCursorCLI(jobID string, prompt string, projectPath string, cursorCLI
 		return nil, fmt.Errorf("명령어 시작 실패: %w", err)
 	}
 
-	err = cmd.Wait()
+	// 5.5. cmd.Wait()를 별도 goroutine에서 실행하고 타임아웃과 동시에 처리
+	done := make(chan error, 1)
+	go func() {
+		done <- cmd.Wait()
+	}()
 
-	// 6. 출력 결합
-	combinedOutput := append(outb.Bytes(), errb.Bytes()...)
-
-	// 7. 에러 처리 (타임아웃 확인)
-	if ctx.Err() == context.DeadlineExceeded {
-		log.Printf("[%s] 작업 시간 초과 (120초). 프로세스 그룹 강제 종료 시도...", jobID)
-		// (보안 핵심) 프로세스 그룹 전체를 강제 종료
-		if err := killProcessGroup(cmd); err != nil {
+	// 타임아웃 또는 완료 대기
+	select {
+	case <-ctx.Done():
+		// 타임아웃 발생 - 프로세스 그룹 강제 종료
+		log.Printf("[%s] 작업 시간 초과 (15분). 프로세스 그룹 강제 종료 시도...", jobID)
+		if err := KillProcessGroup(cmd); err != nil {
 			log.Printf("[%s] 프로세스 종료 실패: %v", jobID, err)
 		}
-		return combinedOutput, fmt.Errorf("명령어 실행 시간 초과 (120초)")
-	}
+		// cmd.Wait()가 완료될 때까지 잠시 대기 (최대 2초)
+		select {
+		case <-done:
+			// 프로세스가 종료됨
+		case <-time.After(2 * time.Second):
+			// 강제 종료 후에도 종료되지 않으면 로그만 남김
+			log.Printf("[%s] 프로세스 종료 대기 시간 초과", jobID)
+		}
+		// 출력 결합
+		combinedOutput := append(outb.Bytes(), errb.Bytes()...)
+		return combinedOutput, fmt.Errorf("명령어 실행 시간 초과 (15분)")
 
-	if err != nil {
-		return combinedOutput, fmt.Errorf("cursor-agent 실행 실패: %w", err)
+	case err = <-done:
+		// 정상 완료 또는 에러
+		// 출력 결합
+		combinedOutput := append(outb.Bytes(), errb.Bytes()...)
+		if err != nil {
+			return combinedOutput, fmt.Errorf("cursor-agent 실행 실패: %w", err)
+		}
+		return combinedOutput, nil
 	}
+}
 
-	return combinedOutput, nil
+// formatSuccessOutput은 cursor-agent 성공 출력을 Slack 마크다운으로 포맷팅합니다.
+// 반환값: 메시지 배열 (40,000자씩 분할)
+func formatSuccessOutput(jobID string, rawOutput string, prompt string) []string {
+	var result strings.Builder
+	result.WriteString("✅ *Cursor AI 작업 완료*\n\n")
+	result.WriteString(fmt.Sprintf("📝 *요청 프롬프트*\n> %s\n\n", prompt))
+	
+	// cursor-agent 출력 파싱
+	lines := strings.Split(rawOutput, "\n")
+	
+	// 변경된 파일 목록 추출
+	modifiedFiles := extractModifiedFiles(lines)
+	if len(modifiedFiles) > 0 {
+		result.WriteString("📁 *변경된 파일*\n")
+		for _, file := range modifiedFiles {
+			result.WriteString(fmt.Sprintf("• `%s`\n", file))
+		}
+		result.WriteString("\n")
+	}
+	
+	// 주요 변경 사항 추출 (diff가 있으면 표시)
+	changes := extractChangeSummary(lines)
+	if changes != "" {
+		result.WriteString("🔧 *주요 변경 사항*\n")
+		result.WriteString(changes)
+		result.WriteString("\n")
+	}
+	
+	// 원본 출력 (마크다운 렌더링을 위해 코드블록 제거)
+	result.WriteString("📄 *실행 결과*\n")
+	result.WriteString(rawOutput)
+	result.WriteString(fmt.Sprintf("\n\n🆔 Job ID: `%s`", jobID[:8]))
+	
+	// 메시지를 40,000자 단위로 분할
+	return splitMessage(result.String())
+}
+
+// formatErrorOutput은 에러 출력을 Slack 마크다운으로 포맷팅합니다.
+// 반환값: 메시지 배열 (40,000자씩 분할)
+func formatErrorOutput(jobID string, err error, rawOutput string) []string {
+	var result strings.Builder
+	result.WriteString("❌ *Cursor AI 실행 중 오류 발생*\n\n")
+	result.WriteString(fmt.Sprintf("🚨 *오류 메시지*\n> %s\n\n", err.Error()))
+	
+	if rawOutput != "" {
+		result.WriteString("📄 *출력 내용*\n")
+		result.WriteString("```\n")
+		result.WriteString(rawOutput)
+		result.WriteString("\n```\n")
+	}
+	
+	result.WriteString(fmt.Sprintf("\n💡 자세한 정보: `/cursor show %s`", jobID[:8]))
+	
+	// 메시지를 40,000자 단위로 분할
+	return splitMessage(result.String())
+}
+
+// extractModifiedFiles는 cursor-agent 출력에서 변경된 파일 목록을 추출합니다.
+func extractModifiedFiles(lines []string) []string {
+	var files []string
+	filePattern := []string{
+		"Modified:",
+		"Created:",
+		"Deleted:",
+		"Updated:",
+		"File:",
+		"✓",
+		"modified:",
+		"created:",
+	}
+	
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		for _, pattern := range filePattern {
+			if strings.Contains(strings.ToLower(line), strings.ToLower(pattern)) {
+				// 파일명 추출 시도
+				parts := strings.Fields(line)
+				for _, part := range parts {
+					// .go, .js, .ts, .py 등 파일 확장자가 있는 경우
+					if strings.Contains(part, ".") && !strings.HasPrefix(part, ".") {
+						// 특수 문자 제거
+						file := strings.Trim(part, "`:,;\"'")
+						if file != "" && !stringSliceContains(files, file) {
+							files = append(files, file)
+						}
+					}
+				}
+			}
+		}
+	}
+	
+	return files
+}
+
+// extractChangeSummary는 변경 사항 요약을 추출합니다.
+func extractChangeSummary(lines []string) string {
+	var summary strings.Builder
+	inDiff := false
+	diffCount := 0
+	maxDiffLines := 20 // 최대 20줄까지만 표시
+	
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		
+		// diff 시작 감지
+		if strings.HasPrefix(trimmed, "diff --git") || 
+		   strings.HasPrefix(trimmed, "---") || 
+		   strings.HasPrefix(trimmed, "+++") {
+			inDiff = true
+			continue
+		}
+		
+		// diff 내용 (+ or - 로 시작)
+		if inDiff && (strings.HasPrefix(trimmed, "+") || strings.HasPrefix(trimmed, "-")) {
+			if diffCount < maxDiffLines {
+				if strings.HasPrefix(trimmed, "+") && !strings.HasPrefix(trimmed, "+++") {
+					summary.WriteString(fmt.Sprintf("• ➕ %s\n", strings.TrimPrefix(trimmed, "+")))
+					diffCount++
+				} else if strings.HasPrefix(trimmed, "-") && !strings.HasPrefix(trimmed, "---") {
+					summary.WriteString(fmt.Sprintf("• ➖ %s\n", strings.TrimPrefix(trimmed, "-")))
+					diffCount++
+				}
+			}
+		}
+		
+		// Summary, Changes 등의 섹션 추출
+		if strings.HasPrefix(strings.ToLower(trimmed), "summary:") ||
+		   strings.HasPrefix(strings.ToLower(trimmed), "changes:") {
+			summary.WriteString(fmt.Sprintf("%s\n", trimmed))
+		}
+	}
+	
+	if diffCount >= maxDiffLines {
+		summary.WriteString("• ... (더 많은 변경 사항이 있습니다)\n")
+	}
+	
+	return summary.String()
+}
+
+// stringSliceContains는 문자열 슬라이스에 특정 문자열이 있는지 확인합니다.
+func stringSliceContains(slice []string, item string) bool {
+	for _, s := range slice {
+		if s == item {
+			return true
+		}
+	}
+	return false
+}
+
+// splitMessage는 메시지를 Slack 최대 크기(40,000자)로 분할합니다.
+func splitMessage(message string) []string {
+	const maxSlackMessageSize = 40000
+	const maxMessages = 5 // Slack response_url 최대 호출 횟수
+	
+	// 메시지가 최대 크기 이하면 그대로 반환
+	if len(message) <= maxSlackMessageSize {
+		return []string{message}
+	}
+	
+	var messages []string
+	remaining := message
+	
+	for len(remaining) > 0 && len(messages) < maxMessages {
+		chunkSize := maxSlackMessageSize
+		
+		// 남은 메시지가 최대 크기보다 작으면 전부 추가
+		if len(remaining) <= chunkSize {
+			messages = append(messages, remaining)
+			break
+		}
+		
+		// 코드 블록(```)이 중간에 잘리지 않도록 조정
+		chunk := remaining[:chunkSize]
+		
+		// 마지막 줄바꿈 위치 찾기 (자연스러운 분할)
+		lastNewline := strings.LastIndex(chunk, "\n")
+		if lastNewline > maxSlackMessageSize-1000 { // 너무 많이 자르지 않도록
+			chunkSize = lastNewline + 1
+			chunk = remaining[:chunkSize]
+		}
+		
+		messages = append(messages, chunk)
+		remaining = remaining[chunkSize:]
+	}
+	
+	// 마지막 메시지가 너무 길면 경고 추가
+	if len(remaining) > 0 {
+		log.Printf("메시지가 너무 길어서 %d자가 잘렸습니다.", len(remaining))
+		lastMsg := messages[len(messages)-1]
+		messages[len(messages)-1] = lastMsg + fmt.Sprintf("\n\n⚠️ 메시지가 너무 길어서 %d자가 생략되었습니다.", len(remaining))
+	}
+	
+	// 페이지 번호 추가 (여러 메시지인 경우)
+	if len(messages) > 1 {
+		for i := range messages {
+			pageInfo := fmt.Sprintf("\n\n📄 페이지 %d/%d", i+1, len(messages))
+			messages[i] = pageInfo + "\n" + messages[i]
+		}
+	}
+	
+	return messages
+}
+
+// sendMultipleMessages는 여러 메시지를 순차적으로 전송합니다.
+func sendMultipleMessages(responseURL string, messages []string, jobID string, allowedDomains []string) {
+	for i, message := range messages {
+		log.Printf("[%s] 메시지 전송 (%d/%d): %d자", jobID, i+1, len(messages), len(message))
+		sendDelayedResponse(responseURL, message, allowedDomains)
+		
+		// 메시지 간 짧은 대기 (Slack rate limit 방지)
+		if i < len(messages)-1 {
+			time.Sleep(500 * time.Millisecond)
+		}
+	}
 }
 
 // sendDelayedResponse는 SSRF 공격을 방지하기 위해 ResponseURL을 검증한 후 전송합니다.
@@ -766,8 +1003,10 @@ func handleShowCommand(c *gin.Context, cfg *Config, jobID string) {
 		if len(output) > 1000 {
 			output = output[:997] + "..."
 		}
-		response.WriteString(fmt.Sprintf("\n📝 *출력:*\n```\n%s\n```", output))
+		// 마크다운 렌더링을 위해 코드블록 제거
+		response.WriteString(fmt.Sprintf("\n📝 *출력:*\n%s", output))
 	} else if job.Status == "failed" && job.Error != "" {
+		// 에러는 코드블록 유지 (에러 메시지는 일반 텍스트)
 		response.WriteString(fmt.Sprintf("\n❌ *오류:*\n```\n%s\n```", job.Error))
 	}
 

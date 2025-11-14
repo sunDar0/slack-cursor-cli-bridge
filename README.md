@@ -20,15 +20,20 @@ Slack 슬래시 커맨드를 통해 Cursor AI CLI를 실행할 수 있는 Go 서
 - ✅ **SQLite 기반 작업 결과 저장** (v1.3)
 - ✅ **작업 조회 API** (`/api/jobs/:id`, `/api/jobs`) (v1.3)
 - ✅ **동적 프로젝트 경로 관리** (`/api/config/project-path`) (v1.2)
+- ✅ **Slack 명령어 확장** (`help`, `list`, `show`, `path`, `set-path`) (v1.3)
+- ✅ **작업 진행 상황 업데이트** (2분마다 상태 전송) (v1.3)
 - ✅ Swagger UI를 통한 API 문서 및 테스트
 - ✅ Process Group 관리 (타임아웃 시 자식 프로세스 종료)
 - ✅ SSRF 방어 (허용 도메인 검증)
+- ✅ Graceful Shutdown (서버 종료 시 정리)
+
+**구현 완료되었으나 아직 활성화되지 않은 기능:**
+- 🔨 **Worker Pool 아키텍처** (코드 작성 완료, 활성화 대기 중)
 
 **향후 추가 예정 (원/구체 단계):**
-- Worker Pool 아키텍처
 - Viper 설정 관리
 - Redis 기반 분산 작업 큐
-- Graceful Shutdown
+- Webhook 기반 작업 완료 알림
 
 ## 빠른 시작 🚀
 
@@ -293,15 +298,25 @@ curl -X POST http://localhost:8080/api/config/project-path \
 /cursor set-path /Users/username/myproject
 ```
 
+**Slack 명령어 목록:**
+- `/cursor "프롬프트"` - Cursor AI 작업 실행
+- `/cursor help` - 도움말 보기
+- `/cursor set-path <경로>` - 프로젝트 경로 설정
+- `/cursor path` - 현재 프로젝트 경로 확인
+- `/cursor list` - 최근 작업 목록 보기 (최근 10개)
+- `/cursor show <job-id>` - 특정 작업 결과 상세 보기
+
 **동작 흐름:**
 1. `/cursor` 명령어 입력 → 즉시 "⏳ 요청을 접수했습니다" 메시지 표시
-2. 서버에서 cursor-agent 실행 (최대 120초)
-3. 완료 후 채널에 결과 메시지 자동 전송
+2. 서버에서 cursor-agent 실행 (최대 15분)
+3. 작업 진행 중 2분마다 진행 상황 업데이트 전송
+4. 완료 후 채널에 결과 메시지 자동 전송
 
 **특징:**
 - ✅ 자연어로 작업을 설명하면 Cursor AI가 프로젝트 전체를 컨텍스트로 분석합니다
 - ✅ `--force` 플래그가 자동으로 추가되어 파일 수정이 허용됩니다
 - ✅ 모든 작업은 SQLite DB에 저장되어 나중에 조회 가능합니다
+- ✅ 작업 진행 중 주기적으로 상태 업데이트를 받을 수 있습니다
 - ✅ HMAC 인증으로 보안이 보장됩니다
 
 ### 2️⃣ 일반 API로 사용하기 (테스트/개발용)
@@ -395,8 +410,9 @@ curl "http://localhost:8080/api/jobs?status=completed&limit=10"
 **v1.3 주요 흐름:**
 1. 요청 수신 → 작업 생성 (DB에 `pending` 상태 저장)
 2. cursor-agent 실행 전 → `running` 상태로 업데이트
-3. 실행 완료 → 결과와 함께 `completed` 또는 `failed` 상태로 업데이트
-4. 사용자는 `/api/jobs/:id`로 언제든지 작업 결과 조회 가능
+3. 작업 진행 중 → 2분마다 진행 상황 업데이트 전송 (최대 4회)
+4. 실행 완료 → 결과와 함께 `completed` 또는 `failed` 상태로 업데이트
+5. 사용자는 `/api/jobs/:id` 또는 `/cursor show <job-id>`로 언제든지 작업 결과 조회 가능
 
 ## 프로젝트 구조
 
@@ -408,14 +424,28 @@ curl "http://localhost:8080/api/jobs?status=completed&limit=10"
 │   ├── server/
 │   │   ├── handlers.go              # 핸들러 (Slack + API + Jobs)
 │   │   ├── router.go                # Gin 라우터 설정
+│   │   ├── process_unix.go          # Unix 프로세스 관리
+│   │   ├── process_windows.go       # Windows 프로세스 관리
 │   │   └── middleware/
 │   │       └── slack_auth.go        # HMAC 인증 미들웨어
-│   └── database/
-│       └── database.go              # SQLite 작업 저장소 (v1.3)
+│   ├── database/
+│   │   └── database.go              # SQLite 작업 저장소 (v1.3)
+│   ├── worker/                      # Worker Pool 아키텍처 (구현 완료, 활성화 대기)
+│   │   ├── dispatcher.go            # 작업 디스패처
+│   │   ├── worker.go                # 작업자 구현
+│   │   ├── job.go                    # 작업 정의
+│   │   └── task_executor.go         # 실제 작업 실행기
+│   ├── ngrok/
+│   │   └── ngrok.go                  # ngrok 관리
+│   └── setup/
+│       ├── setup.go                  # 설정 마법사
+│       ├── checker.go                # 의존성 확인
+│       └── installer.go               # 자동 설치
 ├── docs/                            # Swagger 문서 (자동 생성)
 │   ├── docs.go
 │   ├── swagger.json
-│   └── swagger.yaml
+│   ├── swagger.yaml
+│   └── technical/                   # 기술 설계 문서
 ├── data/                            # SQLite 데이터베이스 (git ignore)
 │   └── jobs.db
 ├── logs/                            # 개발 로그 파일 (git ignore)
@@ -423,9 +453,11 @@ curl "http://localhost:8080/api/jobs?status=completed&limit=10"
 │   ├── ngrok.log
 │   └── .dev-pids
 ├── start-dev.sh                     # 개발 환경 시작 스크립트
+├── build.sh                         # 크로스 컴파일 스크립트
 ├── go.mod
 ├── README.md                        # 프로젝트 개요 및 사용법
-└── SETUP.md                         # 제3자를 위한 설치 가이드
+├── SETUP.md                         # 제3자를 위한 설치 가이드
+└── DEPLOY.md                        # 빌드 및 배포 가이드
 ```
 
 ## Swagger API 문서
@@ -482,7 +514,7 @@ v1.3에서 구현된 보안 기능:
 
 - ✅ **HMAC-SHA256 서명 검증**: Slack에서 온 요청인지 확인 (모든 `/slack/*` 엔드포인트)
 - ✅ **타임스탬프 검증**: 5분 이상 오래된 요청 거부 (Replay Attack 방어)
-- ✅ **Context Timeout**: cursor-agent 실행 시 120초 타임아웃
+- ✅ **Context Timeout**: cursor-agent 실행 시 15분 타임아웃
 - ✅ **Process Group 관리**: 타임아웃 시 자식 프로세스까지 모두 종료
 - ✅ **SSRF 방어**: Slack 응답 URL 도메인 검증 (`hooks.slack.com`만 허용)
 - ✅ **동적 프로젝트 경로 검증**: 설정되지 않은 경우 실행 거부
@@ -598,7 +630,7 @@ curl -X POST http://localhost:8080/api/config/project-path \
 
 v1.3 완료! 다음 기능들을 추가할 예정입니다:
 
-- [ ] Worker Pool + Job Queue 아키텍처 (동시성 제어)
+- [ ] Worker Pool 아키텍처 활성화 (코드 작성 완료, 활성화 대기)
 - [ ] Viper를 사용한 설정 관리
 - [ ] Redis 기반 분산 작업 큐
 - [ ] Webhook 기반 작업 완료 알림

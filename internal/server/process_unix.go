@@ -8,17 +8,17 @@ import (
 	"syscall"
 )
 
-// setupProcessGroup configures the process to be in its own process group
+// SetupProcessGroup configures the process to be in its own process group
 // This allows killing the entire process tree on timeout
-func setupProcessGroup(cmd *exec.Cmd) {
+func SetupProcessGroup(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Setpgid: true,
 	}
 }
 
-// killProcessGroup kills the entire process group
+// KillProcessGroup kills the entire process group
 // On Unix, we use negative PID to target the process group
-func killProcessGroup(cmd *exec.Cmd) error {
+func KillProcessGroup(cmd *exec.Cmd) error {
 	if cmd.Process == nil {
 		return nil
 	}
