@@ -2,6 +2,7 @@ package database
 
 import (
 	"database/sql"
+	"fmt"
 	"log"
 	"time"
 
@@ -152,14 +153,31 @@ func (db *DB) UpdateJobResult(jobID string, output string, errMsg string) error 
 
 // GetJob은 작업 레코드를 조회합니다
 func (db *DB) GetJob(jobID string) (*JobRecord, error) {
-	query := `
-		SELECT id, prompt, project_path, status, output, error, 
-		       user_id, user_name, created_at, started_at, completed_at, duration
-		FROM job_records WHERE id = ?
-	`
+	// v1.4.1: 8자리 prefix 검색 지원 (Slack UX 개선)
+	// 8자리면 LIKE 'prefix%' 검색, 그 외는 정확히 일치
+	var query string
+	var searchID string
+	
+	if len(jobID) == 8 {
+		// 접두사 검색 (예: "3a15a0af" → "3a15a0af%")
+		query = `
+			SELECT id, prompt, project_path, status, output, error, 
+			       user_id, user_name, created_at, started_at, completed_at, duration
+			FROM job_records WHERE id LIKE ? LIMIT 1
+		`
+		searchID = jobID + "%"
+	} else {
+		// 정확한 일치 검색
+		query = `
+			SELECT id, prompt, project_path, status, output, error, 
+			       user_id, user_name, created_at, started_at, completed_at, duration
+			FROM job_records WHERE id = ?
+		`
+		searchID = jobID
+	}
 
 	job := &JobRecord{}
-	err := db.conn.QueryRow(query, jobID).Scan(
+	err := db.conn.QueryRow(query, searchID).Scan(
 		&job.ID,
 		&job.Prompt,
 		&job.ProjectPath,
@@ -175,10 +193,13 @@ func (db *DB) GetJob(jobID string) (*JobRecord, error) {
 	)
 
 	if err == sql.ErrNoRows {
-		return nil, nil
+		if len(jobID) == 8 {
+			return nil, fmt.Errorf("'%s'로 시작하는 작업을 찾을 수 없습니다", jobID)
+		}
+		return nil, fmt.Errorf("작업을 찾을 수 없습니다: %s", jobID)
 	}
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("작업 조회 실패: %w", err)
 	}
 
 	return job, nil

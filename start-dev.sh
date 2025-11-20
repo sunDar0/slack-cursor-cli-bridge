@@ -21,27 +21,93 @@ cleanup() {
     echo ""
     echo -e "${YELLOW}🛑 서버를 종료합니다...${NC}"
     
+    # v1.4.1: 강력한 프로세스 종료 (SIGTERM → SIGKILL)
     if [ -f "$PIDS_FILE" ]; then
         while IFS= read -r pid; do
             if ps -p "$pid" > /dev/null 2>&1; then
-                echo "  종료: PID $pid"
-                kill "$pid" 2>/dev/null
+                echo "  종료 시도: PID $pid"
+                # SIGTERM 전송 (graceful shutdown 시도)
+                kill -TERM "$pid" 2>/dev/null
+                sleep 1
+                
+                # 여전히 살아있으면 SIGKILL
+                if ps -p "$pid" > /dev/null 2>&1; then
+                    echo "  강제 종료: PID $pid"
+                    kill -9 "$pid" 2>/dev/null
+                    sleep 0.5
+                fi
             fi
         done < "$PIDS_FILE"
         rm "$PIDS_FILE"
     fi
     
     # ngrok 프로세스 정리
-    pkill -f "ngrok http" 2>/dev/null
+    pkill -9 -f "ngrok http" 2>/dev/null
+    
+    # 포트 정리 확인
+    echo -e "${YELLOW}🔍 포트 8080 정리 확인 중...${NC}"
+    PORT_PIDS=$(lsof -ti :8080 2>/dev/null)
+    if [ -n "$PORT_PIDS" ]; then
+        echo "  포트 8080 사용 프로세스 강제 종료: $PORT_PIDS"
+        echo "$PORT_PIDS" | xargs kill -9 2>/dev/null
+    fi
     
     echo -e "${GREEN}✅ 정리 완료${NC}"
     exit 0
+}
+
+# 시작 전 포트 정리 함수 (v1.4.1)
+cleanup_port() {
+    local port=$1
+    echo -e "${YELLOW}🔍 포트 $port 정리 중...${NC}"
+    
+    # lsof로 포트 사용 프로세스 찾기
+    local pids=$(lsof -ti ":$port" 2>/dev/null)
+    
+    if [ -n "$pids" ]; then
+        echo -e "${YELLOW}⚠️  포트 $port가 이미 사용 중입니다.${NC}"
+        echo "  사용 중인 프로세스: $pids"
+        echo "  기존 프로세스를 종료합니다..."
+        
+        for pid in $pids; do
+            # 프로세스 정보 출력
+            ps -p "$pid" -o pid,command 2>/dev/null || true
+            
+            # SIGTERM 시도
+            kill -TERM "$pid" 2>/dev/null
+            sleep 1
+            
+            # 여전히 살아있으면 SIGKILL
+            if ps -p "$pid" > /dev/null 2>&1; then
+                echo "  강제 종료: PID $pid"
+                kill -9 "$pid" 2>/dev/null
+                sleep 0.5
+            fi
+        done
+        
+        # 최종 확인
+        sleep 1
+        local remaining=$(lsof -ti ":$port" 2>/dev/null)
+        if [ -n "$remaining" ]; then
+            echo -e "${RED}❌ 포트 정리 실패. 수동으로 종료하세요: kill -9 $remaining${NC}"
+            exit 1
+        fi
+        
+        echo -e "${GREEN}✅ 포트 $port 정리 완료${NC}"
+    else
+        echo -e "${GREEN}✅ 포트 $port 사용 가능${NC}"
+    fi
 }
 
 # Ctrl+C 시그널 처리
 trap cleanup SIGINT SIGTERM
 
 echo -e "${BLUE}🚀 Slack-Cursor-Hook 개발 환경 시작${NC}"
+echo ""
+
+# v1.4.1: 시작 전 포트 정리
+cleanup_port 8080
+cleanup_port 4040  # ngrok 대시보드
 echo ""
 
 # 1. Go 서버 시작

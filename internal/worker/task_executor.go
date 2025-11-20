@@ -355,7 +355,7 @@ func (te *TaskExecutor) formatSuccessOutput(jobID string, rawOutput string, prom
 	}
 	
 	// 원본 출력 (마크다운 → Slack mrkdwn 변환)
-	result.WriteString("📄 *실행 결과*\n")
+	result.WriteString("📄 *실행 결과*\n\n")
 	slackFormattedOutput := te.convertMarkdownToSlack(rawOutput)
 	result.WriteString(slackFormattedOutput)
 	result.WriteString(fmt.Sprintf("\n\n🆔 Job ID: `%s`", jobID[:8]))
@@ -372,7 +372,7 @@ func (te *TaskExecutor) formatErrorOutput(jobID string, err error, rawOutput str
 	result.WriteString(fmt.Sprintf("🚨 *오류 메시지*\n> %s\n\n", err.Error()))
 	
 	if rawOutput != "" {
-		result.WriteString("📄 *출력 내용*\n")
+		result.WriteString("📄 *출력 내용*\n\n")
 		// 에러 출력도 Slack 형식으로 변환
 		slackFormattedOutput := te.convertMarkdownToSlack(rawOutput)
 		result.WriteString(slackFormattedOutput)
@@ -611,7 +611,8 @@ func (te *TaskExecutor) convertMarkdownToSlack(markdown string) string {
 	
 	for _, line := range lines {
 		// 코드 블록 시작/종료 감지
-		if strings.HasPrefix(strings.TrimSpace(line), "```") {
+		trimmedLine := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmedLine, "```") {
 			inCodeBlock = !inCodeBlock
 			result.WriteString(line)
 			result.WriteString("\n")
@@ -680,7 +681,18 @@ func (te *TaskExecutor) convertMarkdownToSlack(markdown string) string {
 		result.WriteString("\n")
 	}
 	
-	return result.String()
+	// 코드 블록이 제대로 닫히지 않은 경우 강제로 닫기
+	if inCodeBlock {
+		result.WriteString("```\n")
+	}
+	
+	output := result.String()
+	// 결과가 코드블록으로 시작하는 경우 앞에 빈 줄 추가 (슬랙 파싱 안정성)
+	if strings.HasPrefix(strings.TrimSpace(output), "```") {
+		output = "\n" + output
+	}
+	
+	return output
 }
 
 // convertMarkdownLinks는 마크다운 링크 [text](url)를 Slack 형식 <url|text>로 변환합니다.
