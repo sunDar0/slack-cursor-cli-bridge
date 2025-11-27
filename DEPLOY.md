@@ -214,6 +214,7 @@ macOS에서 Linux용 CGO 빌드는 복잡합니다:
 - [SETUP.md](./SETUP.md) - 사용자용 설치 가이드
 - [README.md](./README.md) - 프로젝트 개요
 - [build.sh](./build.sh) - 크로스 컴파일 스크립트
+- [docs/technical/deployment-strategy.md](./docs/technical/deployment-strategy.md) - 배포 전략 가이드
 
 ---
 

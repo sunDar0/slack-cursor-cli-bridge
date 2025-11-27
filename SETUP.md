@@ -403,7 +403,7 @@ cloudflared tunnel create slack-cursor
 **옵션 3 - 실제 서버 배포:**
 - Google Cloud Run (무료 티어)
 - Fly.io (무료 티어)
-- 자세한 내용은 `토이 프로젝트 무료 배포 전략 비교.md` 참조
+   - 자세한 내용은 `docs/technical/deployment-strategy.md` 참조
 
 ### ❌ "프로젝트 경로가 설정되지 않았습니다"
 
@@ -450,7 +450,7 @@ lsof -ti:8080 | xargs kill -9
    ```
 
 3. **실제 배포:**
-   - `토이 프로젝트 무료 배포 전략 비교.md` 참조
+   - `docs/technical/deployment-strategy.md` 참조
    - Google Cloud Run 또는 Fly.io 권장
 
 ---
@@ -458,8 +458,8 @@ lsof -ti:8080 | xargs kill -9
 ## 📚 추가 문서
 
 - **README.md** - 프로젝트 개요 및 사용법
-- **토이 프로젝트 무료 배포 전략 비교.md** - 배포 전략 가이드
-- **docs/technical/** - 기술 설계 문서
+- **docs/technical/deployment-strategy.md** - 배포 전략 가이드
+- **docs/technical/architecture.md** - 기술 설계 문서
 
 ---
 
